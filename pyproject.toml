@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "torch", "pybind11"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kv-marketplace"
+version = "0.1.0"
+description = "Cross-GPU KV Cache Marketplace for transformer inference"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Neel Somani"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "xxhash>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov",
+]
+
+[tool.setuptools]
+packages = ["kv_marketplace", "kv_marketplace.transport", "kv_marketplace.adapter"]
+
+[tool.setuptools.package-data]
+kv_marketplace = ["transport/*.cpp"]
+
+[tool.pytest.ini_options]
+testpaths = ["kv_marketplace/tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+

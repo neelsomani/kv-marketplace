@@ -34,3 +34,131 @@ The MVP will not include:
 * Integration with speculative decoding mechanisms.
 
 Future iterations may expand into these areas after the node-local integration path is complete and validated.
+
+## Installation
+
+### Prerequisites
+
+* Python 3.8 or higher
+* PyTorch 2.0+ with CUDA support
+* CUDA toolkit (for building the CUDA extension)
+* A CUDA-capable GPU (or multiple GPUs for peer-to-peer tests)
+* For peer-to-peer transport: GPUs must support CUDA peer-to-peer access (typically requires NVLink or PCIe Gen3+)
+* On GCP: At least a2-highgpu-2g with 2x A100 GPUs (40GB each) (Deep Learning VM M129 image)
+
+### Setup
+
+1. Install the package and dependencies:
+```bash
+# Verify this works, or otherwise install the correct Nvidia drivers for your machine
+nvidia-smi
+
+# Verify this works as well, or otherwise install CUDA toolchain
+nvcc --version
+
+# Install Torch
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip3 install xxhash pytest
+
+# Verify CUDA is working
+python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPUs: {torch.cuda.device_count()}')"
+
+# Clone repo and install
+git clone git@github.com:neelsomani/kv-marketplace.git
+cd kv-marketplace
+pip3 install -e .
+```
+
+This will:
+* Install the package dependencies (PyTorch, xxhash, etc.)
+* Build the CUDA extension (`p2p_cuda`) for peer-to-peer memory transfer
+
+2. Verify the installation:
+```bash
+python -c "from kv_marketplace.transport import PeerCopy; print('Installation successful')"
+```
+
+### Building the CUDA Extension
+
+The CUDA extension is automatically built during installation. If you need to rebuild it manually:
+
+```bash
+pip install -e . --force-reinstall --no-deps
+```
+
+Or use the setup script directly:
+```bash
+cd kv_marketplace/transport
+python setup.py build_ext --inplace
+```
+
+## Running Tests
+
+The test suite includes unit tests for core components and integration tests for CUDA peer-to-peer transport.
+
+### Running All Tests
+
+```bash
+pytest kv_marketplace/tests/
+```
+
+### Running Specific Test Suites
+
+Core component tests (no CUDA required):
+```bash
+pytest kv_marketplace/tests/test_prefix_index.py
+pytest kv_marketplace/tests/test_registry.py
+```
+
+CUDA peer-to-peer tests (requires 2+ GPUs):
+```bash
+pytest kv_marketplace/tests/test_p2p.py
+```
+
+These tests will automatically skip if:
+* CUDA is not available
+* Less than 2 GPUs are detected
+* GPUs don't support peer-to-peer access
+
+## Examples
+
+### Two-GPU Demo
+
+The `two_gpu_demo.py` script demonstrates peer-to-peer memory transfer between two GPUs without vLLM:
+
+```bash
+python kv_marketplace/examples/two_gpu_demo.py
+```
+
+This script:
+* Creates random data buffers on GPU 0
+* Transfers them to GPU 1 via CUDA peer-to-peer copy
+* Validates the transfer using checksums
+
+Requirements:
+* 2+ GPUs
+* CUDA extension built
+* GPUs must support peer-to-peer access
+
+Expected output:
+```
+Found 2 GPUs
+Creating 10MB buffer on GPU 0...
+Source checksum: <hash>
+Creating destination buffer on GPU 1...
+Enabling peer access between GPU 0 and GPU 1...
+Peer access enabled successfully!
+Performing peer-to-peer copy...
+Copy completed!
+Verifying checksum...
+Destination checksum: <hash>
+✓ SUCCESS: Checksums match! Peer copy validated.
+```
+
+### vLLM Integration Demo
+
+The `vllm_dual_gpu_demo.py` script demonstrates the full integration with vLLM (requires the `vllm-kvm-dev` fork):
+
+```bash
+python kv_marketplace/examples/vllm_dual_gpu_demo.py
+```
