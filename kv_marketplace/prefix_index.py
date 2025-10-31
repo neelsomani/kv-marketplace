@@ -38,7 +38,7 @@ class PrefixIndex:
         if prefix_hash is None:
             prefix_hash = self._hash_sequence(tokens)
         
-        # Insert into trie
+        # Insert into trie, marking all prefix nodes
         node = self._root
         depth = 0
         for token in tokens:
@@ -46,11 +46,14 @@ class PrefixIndex:
                 node.children[token] = TrieNode()
             node = node.children[token]
             depth += 1
-        
-        # Mark end of sequence
-        node.prefix_hash = prefix_hash
-        node.length = depth
-        self._hash_to_length[prefix_hash] = depth
+            
+            # Mark this prefix node with its hash
+            # This allows finding partial prefix matches
+            prefix = tokens[:depth]
+            prefix_hash_at_depth = self._hash_sequence(prefix)
+            node.prefix_hash = prefix_hash_at_depth
+            node.length = depth
+            self._hash_to_length[prefix_hash_at_depth] = depth
         
         return prefix_hash
     
