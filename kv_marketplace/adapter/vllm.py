@@ -388,14 +388,27 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         # Only export the prefix up to length
         prefix_tokens = tokens[:length]
         
+        # Check if we have valid pointers
+        k_ptrs = kv_pages.get('k_ptrs', [])
+        v_ptrs = kv_pages.get('v_ptrs', [])
+        
+        # If pointers are empty, we can't export (get_prefill_pages may have failed)
+        if not k_ptrs or not v_ptrs:
+            logger.warning(
+                f"KV cache pointers are empty for export: length={length}, "
+                f"k_ptrs={len(k_ptrs)}, v_ptrs={len(v_ptrs)}. "
+                f"This may indicate get_prefill_pages needs implementation."
+            )
+            return
+        
         # Compute prefix hash and insert into prefix index
         prefix_hash = _prefix_index.insert(prefix_tokens)
         
         # Build KVHandle from context
         handle = KVHandle(
             device_id=device_id,
-            k_ptrs=kv_pages['k_ptrs'],
-            v_ptrs=kv_pages['v_ptrs'],
+            k_ptrs=k_ptrs,
+            v_ptrs=v_ptrs,
             length=length,
             layout_meta={
                 'n_layers': layout['n_layers'],
@@ -412,7 +425,8 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         # Update file stats (registry size changed)
         _write_stats_to_file()
         
-        logger.info(f"Exported KV cache: length={length}, device={device_id}, prefix_hash={prefix_hash.hex()[:8]}...")
+        logger.info(f"Exported KV cache: length={length}, device={device_id}, prefix_hash={prefix_hash.hex()[:8]}..., "
+                   f"num_blocks={len(k_ptrs)}")
         
     except Exception as e:
         logger.error(f"Error in after_prefill: {e}", exc_info=True)
