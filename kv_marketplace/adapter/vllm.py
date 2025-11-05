@@ -1,25 +1,25 @@
 """vLLM adapter implementing the callback contract."""
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, List, TypedDict
 from .types import KVLayout, AllocatedKV
 from ..compat import KVCompat
 
 
-class VLLMImportCtx:
+class VLLMImportCtx(TypedDict):
     """Context for importing KV cache before prefill."""
     device_id: int
     compat: KVCompat
-    tokens: list
+    tokens: List[int]
     alloc_prefix: Callable[[int], AllocatedKV]
     layout: KVLayout
     stream: int  # cudaStream_t as int
 
 
-class VLLMExportCtx:
+class VLLMExportCtx(TypedDict):
     """Context for exporting KV cache after prefill."""
     device_id: int
     compat: KVCompat
-    tokens: list
+    tokens: List[int]
     kv_pages: AllocatedKV   # [0:prompt_len]
     layout: KVLayout
     length: int

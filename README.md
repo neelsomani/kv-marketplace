@@ -39,42 +39,78 @@ Future iterations may expand into these areas after the node-local integration p
 
 ### Prerequisites
 
-* Python 3.8 or higher
-* PyTorch 2.0+ with CUDA support
+* Debian 12
+* Python 3.11 (uv)
+* PyTorch 2.0+ with CUDA support (CUDA 12.8)
 * CUDA toolkit (for building the CUDA extension)
 * A CUDA-capable GPU (or multiple GPUs for peer-to-peer tests)
 * For peer-to-peer transport: GPUs must support CUDA peer-to-peer access (typically requires NVLink or PCIe Gen3+)
-* On GCP: At least a2-highgpu-2g with 2x A100 GPUs (40GB each) (Deep Learning VM M129 image)
+* On GCP: At least a2-highgpu-2g with 2x A100 GPUs (40GB each)
 
 ### Setup
 
-1. Install the package and dependencies:
+Install the package and dependencies:
 ```bash
-# Verify this works, or otherwise install the correct Nvidia drivers for your machine
+# Verify this gives 12.8
 nvidia-smi
 
-# Verify this works as well, or otherwise install CUDA toolchain
+# Verify this works as well for 12.8
+sudo ln -sfn /usr/local/cuda-12.8 /usr/local/cuda
+export CUDA_HOME=/usr/local/cuda
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 nvcc --version
 
-# Install Torch
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip3 install xxhash pytest
+# Install Python matching CUDA 12.8
+pip install -U pip wheel setuptools
+pip install --index-url https://download.pytorch.org/whl/cu128 \
+    torch torchvision torchaudio
 
 # Verify CUDA is working
-python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPUs: {torch.cuda.device_count()}')"
+python - <<'PY'
+import torch, numpy
+print("torch:", torch.__version__, "cuda:", torch.version.cuda)
+print("numpy:", numpy.__version__)
+print(f'CUDA available: {torch.cuda.is_available()}')
+print(f'GPUs: {torch.cuda.device_count()}')
+PY
+
+# vLLM dependencies
+pip install -U pip wheel setuptools ninja cmake packaging
+pip install "ray[cgraph]>=2.48.0" numba==0.61.2 \
+  openai-harmony>=0.0.3 anthropic==0.71.0 \
+  pybase64 cbor2 setproctitle fastapi pydantic<3 uvicorn httpx safetensors
+
+# Clone and install forked vLLM for demo - might require resolving dependency conflicts
+export TORCH_CUDA_ARCH_LIST="8.0"  # A100
+export VLLM_DISABLE_FP8=1
+export VLLM_USE_XFORMERS=0
+export MAX_JOBS=8
+git clone https://github.com/neelsomani/vllm.git
+cd vllm
+git fetch origin vllm-kvm-dev
+git checkout vllm-kvm-dev
+pip install -r requirements/build.txt
+pip install --no-deps --no-build-isolation -e .
+pip install -r requirements/common.txt
+
+# Alternatively - dependency fixes I needed
+unset VLLM_USE_PRECOMPILED
+unset VLLM_PRECOMPILED_WHEEL_LOCATION
+cd vllm
+python use_existing_torch.py
+export MAX_JOBS=8
+pip install -r requirements/build.txt
+pip install --no-build-isolation -e .
+pip install -r requirements/common.txt
 
 # Clone repo and install
+cd ../
 git clone git@github.com:neelsomani/kv-marketplace.git
 cd kv-marketplace
 pip3 install -e .
-```
 
-This will:
-* Install the package dependencies (PyTorch, xxhash, etc.)
-* Build the CUDA extension (`p2p_cuda`) for peer-to-peer memory transfer
-
-2. Verify the installation:
-```bash
+# Verify the installation
 python -c "from kv_marketplace.transport import PeerCopy; print('Installation successful')"
 ```
 
@@ -120,7 +156,66 @@ These tests will automatically skip if:
 * Less than 2 GPUs are detected
 * GPUs don't support peer-to-peer access
 
-## Examples
+## Testing vLLM Integration
+
+To verify that the patched vLLM fork correctly loads and calls the kv-marketplace hooks:
+
+### Quick Smoke Test
+
+Run vLLM with the `--kv-marketplace` flag enabled on a small model:
+
+```bash
+# Test that vLLM runs with kv-marketplace enabled (hooks should be called)
+python -m vllm.entrypoints.llm \
+    --model distilbert/distilgpt2 \
+    --kv-marketplace \
+    --kv-min-prefix 64 \
+    --gpu-memory-utilization 0.1 \
+    --enforce-eager \
+    --max-model-len 128
+```
+
+Then in another terminal, send a test request:
+
+```bash
+python -c "
+from vllm import LLM, SamplingParams
+llm = LLM(model='distilbert/distilgpt2', kv_marketplace=True, gpu_memory_utilization=0.1, enforce_eager=True)
+outputs = llm.generate(['Hello'], sampling_params=SamplingParams())
+print(outputs[0].outputs[0].text)
+"
+```
+
+Expected behavior:
+* vLLM should start without errors
+* The request should complete successfully
+* With logging enabled, you may see messages like "kv-marketplace: Exported prefix..." (hooks are being called)
+
+### Verify Plugin Loading
+
+Test that the kv-marketplace adapter can be loaded:
+
+```bash
+python -c "from vllm.kv_marketplace_shim import load_plugin; plugin = load_plugin(); print('Plugin loaded:', plugin is not None); print('Has before_prefill:', hasattr(plugin, 'before_prefill') if plugin else False)"
+```
+
+Should output: `Plugin loaded: True` and `Has before_prefill: True`
+
+### Check Logs
+
+Run with logging to see hook activity:
+
+```bash
+VLLM_LOGGING_LEVEL=INFO python -m vllm.entrypoints.llm \
+    --model distilbert/distilgpt2 \
+    --kv-marketplace \
+    --gpu-memory-utilization 0.1 \
+    --enforce-eager
+```
+
+Look for log messages containing "kv-marketplace" indicating the hooks are being called.
+
+## End-to-End Examples
 
 ### Two-GPU Demo
 
