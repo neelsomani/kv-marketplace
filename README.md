@@ -173,6 +173,9 @@ python -m vllm.entrypoints.llm \
     --gpu-memory-utilization 0.1 \
     --enforce-eager \
     --max-model-len 128
+
+# Optional: Allow imports even without peer access (uses slower PCIe path)
+# --kv-allow-pcie
 ```
 
 Then in another terminal, send a test request:
@@ -266,25 +269,20 @@ Run a side-by-side comparison with and without kv-marketplace:
 python kv_marketplace/examples/vllm_dual_gpu_demo.py --model gpt2 --kv-min-prefix 16 --compare
 ```
 
-Use custom system prompts and user prompts:
+Use custom system prompts and user prompts to see the benefit for longer prefixes:
 
 ```bash
 python kv_marketplace/examples/vllm_dual_gpu_demo.py \
-    --model gpt2 \
-    --system-prompt "You are a helpful AI assistant specialized in explaining complex topics." \
-    --user-prompts "What is quantum computing?" "Explain neural networks" "How does encryption work?"
-```
-
-Advanced options:
-
-```bash
-python kv_marketplace/examples/vllm_dual_gpu_demo.py \
-    --model gpt2 \
+    --model gpt2-medium \
+    --system-prompt "You are an exceptionally knowledgeable and experienced AI assistant with deep expertise spanning multiple domains including advanced science, cutting-edge technology, comprehensive history, world literature, complex mathematics, intricate philosophy, detailed psychology, modern economics, contemporary politics, environmental science, medical knowledge, engineering principles, artistic theory, cultural studies, and current global events. Your responses are meticulously researched, factually accurate, thoroughly comprehensive, and exceptionally well-structured. You excel at breaking down highly complex topics into understandable components while maintaining intellectual rigor. You provide relevant examples, cite important facts, and offer multiple perspectives when appropriate. You adapt your communication style dynamically to match the user's level of expertise while always maintaining clarity, precision, and educational value. When discussing technical or academic topics, you seamlessly provide both high-level conceptual overviews and detailed technical explanations as the context requires. You always strive to be maximally helpful, completely harmless, and rigorously honest in every interaction. Your knowledge base is extensive and you are able to synthesize information from multiple disciplines to provide insightful and nuanced responses. You value evidence-based reasoning, logical consistency, and intellectual humility. When you encounter uncertainty or limitations in your knowledge, you acknowledge them transparently. Your goal is to empower users with accurate information, foster deeper understanding, and facilitate meaningful learning experiences through thoughtful and well-crafted responses." \
+    --user-prompts \
+        "What is the capital of France?" \
+        "Explain quantum computing." \
+        "Write a poem about AI." \
+        "What are renewable energy benefits?" \
+        "How does photosynthesis work?" \
     --num-runs 5 \
     --kv-min-prefix 64 \
-    --gpu-memory-utilization 0.9 \
-    --tensor-parallel-size 2 \
-    --max-model-len 2048 \
     --compare
 ```
 

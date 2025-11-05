@@ -13,6 +13,9 @@ from ..prefix_index import PrefixIndex
 from ..transport.p2p import PeerCopy
 
 logger = logging.getLogger(__name__)
+# Set kv-marketplace logger to INFO to avoid debug overhead in hot paths
+# (vLLM may set root logger to DEBUG, but we want to avoid debug logging overhead)
+logger.setLevel(logging.INFO)
 
 # Detect if we should use file-based backend for multi-process sharing
 # Use environment variable to enable, or auto-detect based on data parallelism
@@ -245,7 +248,7 @@ def reset_stats():
         logger.warning(f"Failed to reset file stats: {e}")
 
 
-class VLLMImportCtx(TypedDict):
+class VLLMImportCtx(TypedDict, total=False):
     """Context for importing KV cache before prefill."""
     device_id: int
     compat: KVCompat
@@ -253,6 +256,7 @@ class VLLMImportCtx(TypedDict):
     alloc_prefix: Callable[[int], AllocatedKV]
     layout: KVLayout
     stream: int  # cudaStream_t as int
+    allow_pcie: bool  # Optional: allow import even without peer access (via PCIe)
 
 
 class VLLMExportCtx(TypedDict):
@@ -297,58 +301,84 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         
         # Find longest common prefix using prefix index
         prefix_index_size = _prefix_index.size()
-        logger.info(f"kv-marketplace before_prefill: Looking for LCP in prefix_index (size={prefix_index_size}, tokens_len={len(tokens)}, first_10_tokens={tokens[:10]})")
+        # logger.debug(f"kv-marketplace before_prefill: Looking for LCP in prefix_index (size={prefix_index_size}, tokens_len={len(tokens)}, first_10_tokens={tokens[:10]})")
         lcp_result = _prefix_index.find_lcp(tokens)
         if lcp_result is None:
-            logger.info(f"kv-marketplace before_prefill: No LCP found for tokens (length={len(tokens)}, prefix_index_size={prefix_index_size})")
+            logger.debug(f"kv-marketplace before_prefill: No LCP found for tokens (length={len(tokens)}, prefix_index_size={prefix_index_size})")
             global _import_misses
             _import_misses += 1
             _write_stats_to_file()
             return None
         
         lcp_len, prefix_hash = lcp_result
-        logger.info(f"kv-marketplace before_prefill: Found LCP (length={lcp_len}, prefix_hash={prefix_hash.hex()[:8]}..., min_prefix={min_prefix})")
+        # logger.debug(f"kv-marketplace before_prefill: Found LCP (length={lcp_len}, prefix_hash={prefix_hash.hex()[:8]}..., min_prefix={min_prefix})")
         
         # Check if LCP meets minimum length requirement
         if lcp_len < min_prefix:
-            logger.info(f"kv-marketplace before_prefill: LCP length {lcp_len} < min_prefix {min_prefix}, skipping import")
+            logger.debug(f"kv-marketplace before_prefill: LCP length {lcp_len} < min_prefix {min_prefix}, skipping import")
             _import_misses += 1
             _write_stats_to_file()
             return None
         
         # Lookup handle in registry
-        logger.info(f"kv-marketplace before_prefill: Looking up handle in registry (size={_registry.size()}, compat_hash={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...)")
+        # logger.debug(f"kv-marketplace before_prefill: Looking up handle in registry (size={_registry.size()}, compat_hash={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...)")
         handle = _registry.lookup(compat, prefix_hash)
         if handle is None:
-            logger.info(f"kv-marketplace before_prefill: No handle found in registry for compat/prefix_hash")
+            logger.debug(f"kv-marketplace before_prefill: No handle found in registry for compat/prefix_hash")
             _import_misses += 1
             _write_stats_to_file()
             return None
         
+        logger.info(f"kv-marketplace: Registry lookup succeeded! handle.device_id={handle.device_id}, current_device_id={device_id}, lcp_len={lcp_len}")
         # Check if handle has valid GPU pointers (not just block IDs)
         # GPU pointers are typically large integers (memory addresses)
         # Block IDs are small integers (0 to num_blocks)
-        if handle.k_ptrs and isinstance(handle.k_ptrs[0], int):
-            # Rough heuristic: GPU pointers are usually > 0x1000000 (16MB)
-            # Block IDs are typically < 10000
-            if handle.k_ptrs[0] < 0x1000000:
-                logger.warning(
-                    f"kv-marketplace before_prefill: Handle contains likely block_ids (first={handle.k_ptrs[0]}), "
-                    f"not GPU pointers. Pointer extraction may have failed. Attempting import anyway..."
-                )
-                # Continue anyway - might still work if it's actually a valid small pointer
+        # Note: We continue anyway - might still work if it's actually a valid small pointer
         
-        logger.info(f"Found KV cache match: lcp_len={lcp_len}, src_dev={handle.device_id}, dst_dev={device_id}")
+        # logger.debug(f"Found KV cache match: lcp_len={lcp_len}, src_dev={handle.device_id}, dst_dev={device_id}")
+        
+        # Optimization: If cache hit is on the same GPU, skip marketplace import
+        # vLLM's native cache management can handle same-GPU reuse more efficiently
+        # without the overhead of explicit copying
+        if handle.device_id == device_id:
+            # Same GPU - let vLLM's native cache management handle local reuse
+            # This avoids unnecessary memory allocation and copying overhead
+            logger.info(f"kv-marketplace: Cache hit on same GPU {device_id} (lcp_len={lcp_len}), skipping marketplace import (let vLLM handle local reuse)")
+            return None
+        
+        # Cross-GPU cache hit - proceed with marketplace import
+        logger.info(f"kv-marketplace: Cross-GPU cache hit found! src_dev={handle.device_id}, dst_dev={device_id}, lcp_len={lcp_len}, proceeding with import")
         
         # Allocate destination KV cache
         dst_alloc = ctx['alloc_prefix'](lcp_len)
         
-        # Ensure peer access is enabled
-        if not PeerCopy.ensure_peer_access(handle.device_id, device_id):
-            logger.warning(f"Peer access not available between GPU {handle.device_id} and GPU {device_id}, skipping import")
-            return None
+        # Check peer access requirement
+        # Note: PeerCopy.ensure_peer_access has C++-level caching, so no need to cache here
+        allow_pcie = ctx.get('allow_pcie', False)
+        has_peer_access = PeerCopy.ensure_peer_access(handle.device_id, device_id)
         
-        # Copy KV tensors from source to destination
+        if not has_peer_access:
+            if not allow_pcie:
+                logger.warning(
+                    f"Peer access not available between GPU {handle.device_id} and GPU {device_id}, "
+                    f"and --kv-allow-pcie not set. Skipping import."
+                )
+                return None
+            else:
+                logger.warning(
+                    f"Peer access not available between GPU {handle.device_id} and GPU {device_id}, "
+                    f"but --kv-allow-pcie is set. Attempting import anyway (may fail or use slower path)."
+                )
+        
+        # Extract page ranges from dst_alloc if available (for coalescing optimization)
+        dst_page_ranges = dst_alloc.get('page_ranges')
+        # Handle page ranges from handle if available
+        src_page_ranges = None
+        if hasattr(handle, 'layout_meta') and handle.layout_meta:
+            # Could extract page ranges from handle if stored
+            pass
+        
+        # Copy KV tensors from source to destination with coalescing
         # Pass the stream directly - PeerCopy.copy_kv accepts int (CUDA stream pointer)
         PeerCopy.copy_kv(
             dst_dev=device_id,
@@ -365,10 +395,16 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
                 'page_size': layout['page_size'],
                 **layout.get('strides', {})
             },
-            stream=ctx['stream']  # Pass int stream pointer directly
+            stream=ctx['stream'],  # Pass int stream pointer directly
+            dst_page_ranges=dst_page_ranges,
+            src_page_ranges=src_page_ranges
         )
         
-        logger.info(f"Successfully imported {lcp_len} tokens from GPU {handle.device_id} to GPU {device_id}")
+        # Synchronize copy completion before suffix prefill (MVP requirement)
+        # This ensures the imported KV cache is fully materialized before vLLM continues
+        PeerCopy.synchronize_stream(ctx['stream'])
+        
+        logger.info(f"kv-marketplace: Successfully imported {lcp_len} tokens from GPU {handle.device_id} to GPU {device_id} (coalesced segments, synchronized)")
         
         # Track successful import
         global _import_hits, _import_lcp_lengths
@@ -419,12 +455,14 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         k_ptrs = kv_pages.get('k_ptrs', [])
         v_ptrs = kv_pages.get('v_ptrs', [])
         
+        """
         logger.debug(
             f"kv-marketplace after_prefill: length={length}, device_id={device_id}, "
             f"k_ptrs={len(k_ptrs)}, v_ptrs={len(v_ptrs)}, "
             f"k_ptrs_sample={k_ptrs[:5] if k_ptrs else []}, "
             f"v_ptrs_sample={v_ptrs[:5] if v_ptrs else []}"
         )
+        """
         
         # If pointers are empty, we can't export (get_prefill_pages may have failed)
         if not k_ptrs or not v_ptrs:
@@ -459,7 +497,7 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         # Update file stats (registry size changed)
         _write_stats_to_file()
         
-        logger.info(f"Exported KV cache: length={length}, device={device_id}, prefix_hash={prefix_hash.hex()[:8]}..., "
+        logger.debug(f"Exported KV cache: length={length}, device={device_id}, prefix_hash={prefix_hash.hex()[:8]}..., "
                    f"num_blocks={len(k_ptrs)}")
         
     except Exception as e:
