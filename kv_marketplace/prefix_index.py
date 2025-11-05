@@ -25,6 +25,10 @@ class PrefixIndex:
         self._root = TrieNode()
         self._hash_to_length: dict[bytes, int] = {}  # cache for hash -> prefix length
     
+    def size(self) -> int:
+        """Get the number of unique prefixes stored in the index."""
+        return len(self._hash_to_length)
+    
     def insert(self, tokens: List[int], prefix_hash: Optional[bytes] = None) -> bytes:
         """Insert a token sequence into the trie.
         

@@ -263,7 +263,7 @@ python kv_marketplace/examples/vllm_dual_gpu_demo.py --model gpt2
 Run a side-by-side comparison with and without kv-marketplace:
 
 ```bash
-python kv_marketplace/examples/vllm_dual_gpu_demo.py --model gpt2 --compare
+python kv_marketplace/examples/vllm_dual_gpu_demo.py --model gpt2 --kv-min-prefix 16 --compare
 ```
 
 Use custom system prompts and user prompts:
@@ -306,37 +306,30 @@ The demo will display:
 
 Example output snippet:
 ```
-================================================================================
-  Benchmark: WITH kv-marketplace
-================================================================================
-Model: gpt2
-System prompt length: 78 chars
-Number of user prompts: 5
-Number of runs: 3
-KV Marketplace: True
-KV Min Prefix: 64
-
-Initializing LLM...
-LLM initialized successfully!
-
-Run 1/3...
-  Average latency: 0.1234s
-  Total time: 0.6170s
-  Throughput: 8.10 req/s
+[...]
+  Stats after run: registry_size=5, prefix_index_size=75, total_import_hits=10, total_import_misses=5
+  Average latency: 0.8995s
+  Total time: 4.4977s
+  Throughput: 1.11 req/s
   Registry size: 5
-  Prefix index size: 5
-  Import hits: 4
-  Import misses: 1
-  Average LCP length: 128.5 tokens
+  Prefix index size: 75
+  Import hits: 5
+  Import misses: 0
 
 ================================================================================
   COMPARISON CHART
 ================================================================================
 
-Metric               Without kv-mkt        With kv-mkt          Improvement
+Metric               Without kv-mkt       With kv-mkt          Improvement         
 --------------------------------------------------------------------------------
-Average Latency      0.1500s              0.1234s             -17.7%
-Throughput          6.67 req/s           8.10 req/s          +21.4%
-Import Hits         0                    4                   N/A
-Avg LCP Length      0.0 tokens           128.5 tokens        N/A
+Average Latency      0.8560004552205404s  0.8420368671417237s  +1.6%               
+Total Latency        12.840006828308105s  12.630553007125854s  +1.6%               
+Throughput           1.168223677804423req/s 1.1875964569039346req/s +1.7%               
+Import Hits          N/A                  10                   N/A                 
+Avg LCP Length       N/A                  32.0tokens           N/A                 
+Registry Size        5                    5                    N/A                 
+
+================================================================================
+
+✓ Demo completed!
 ```

@@ -286,30 +286,47 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
                 return None
         
         # Find longest common prefix using prefix index
+        prefix_index_size = _prefix_index.size()
+        logger.info(f"kv-marketplace before_prefill: Looking for LCP in prefix_index (size={prefix_index_size}, tokens_len={len(tokens)}, first_10_tokens={tokens[:10]})")
         lcp_result = _prefix_index.find_lcp(tokens)
         if lcp_result is None:
-            logger.debug(f"No LCP found for tokens (length={len(tokens)})")
+            logger.info(f"kv-marketplace before_prefill: No LCP found for tokens (length={len(tokens)}, prefix_index_size={prefix_index_size})")
             global _import_misses
             _import_misses += 1
             _write_stats_to_file()
             return None
         
         lcp_len, prefix_hash = lcp_result
+        logger.info(f"kv-marketplace before_prefill: Found LCP (length={lcp_len}, prefix_hash={prefix_hash.hex()[:8]}..., min_prefix={min_prefix})")
         
         # Check if LCP meets minimum length requirement
         if lcp_len < min_prefix:
-            logger.debug(f"LCP length {lcp_len} < min_prefix {min_prefix}, skipping import")
+            logger.info(f"kv-marketplace before_prefill: LCP length {lcp_len} < min_prefix {min_prefix}, skipping import")
             _import_misses += 1
             _write_stats_to_file()
             return None
         
         # Lookup handle in registry
+        logger.info(f"kv-marketplace before_prefill: Looking up handle in registry (size={len(_registry._registry)}, compat_hash={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...)")
         handle = _registry.lookup(compat, prefix_hash)
         if handle is None:
-            logger.debug(f"No handle found for compat={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...")
+            logger.info(f"kv-marketplace before_prefill: No handle found in registry for compat/prefix_hash")
             _import_misses += 1
             _write_stats_to_file()
             return None
+        
+        # Check if handle has valid GPU pointers (not just block IDs)
+        # GPU pointers are typically large integers (memory addresses)
+        # Block IDs are small integers (0 to num_blocks)
+        if handle.k_ptrs and isinstance(handle.k_ptrs[0], int):
+            # Rough heuristic: GPU pointers are usually > 0x1000000 (16MB)
+            # Block IDs are typically < 10000
+            if handle.k_ptrs[0] < 0x1000000:
+                logger.warning(
+                    f"kv-marketplace before_prefill: Handle contains likely block_ids (first={handle.k_ptrs[0]}), "
+                    f"not GPU pointers. Pointer extraction may have failed. Attempting import anyway..."
+                )
+                # Continue anyway - might still work if it's actually a valid small pointer
         
         logger.info(f"Found KV cache match: lcp_len={lcp_len}, src_dev={handle.device_id}, dst_dev={device_id}")
         
