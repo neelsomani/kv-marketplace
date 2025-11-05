@@ -1,6 +1,9 @@
 """vLLM adapter implementing the callback contract."""
 
 import logging
+import json
+import os
+import tempfile
 from typing import Callable, Optional, Tuple, List, TypedDict
 from .types import KVLayout, AllocatedKV
 from ..compat import KVCompat
@@ -17,6 +20,142 @@ _prefix_index = PrefixIndex()
 # Default minimum prefix length (can be overridden by vLLM flags)
 _MIN_PREFIX_LENGTH = 64
 
+# Statistics tracking
+_import_hits = 0
+_import_misses = 0
+_import_lcp_lengths = []
+
+# File-based stats sharing for multiprocessing
+_stats_file = None
+_stats_lock_file = None
+
+
+def _get_stats_file_path():
+    """Get the path to the stats file."""
+    global _stats_file
+    if _stats_file is None:
+        # Use a temp file in /tmp for cross-process access
+        stats_dir = os.path.join(tempfile.gettempdir(), 'kv_marketplace_stats')
+        os.makedirs(stats_dir, exist_ok=True)
+        _stats_file = os.path.join(stats_dir, 'stats.json')
+    return _stats_file
+
+
+def _get_lock_file_path():
+    """Get the path to the lock file."""
+    global _stats_lock_file
+    if _stats_lock_file is None:
+        stats_dir = os.path.join(tempfile.gettempdir(), 'kv_marketplace_stats')
+        os.makedirs(stats_dir, exist_ok=True)
+        _stats_lock_file = os.path.join(stats_dir, 'stats.lock')
+    return _stats_lock_file
+
+
+def _write_stats_to_file():
+    """Write current stats to file for cross-process access.
+    
+    Each process writes its local stats. The file structure is:
+    {
+        "processes": {
+            "pid1": { "import_hits": ..., "import_misses": ..., ... },
+            "pid2": { ... },
+            ...
+        }
+    }
+    """
+    try:
+        import os as os_module
+        pid = os_module.getpid()
+        
+        stats_file = _get_stats_file_path()
+        
+        # Read existing stats
+        existing_stats = _read_stats_from_file_raw()
+        
+        # Update this process's stats
+        if 'processes' not in existing_stats:
+            existing_stats['processes'] = {}
+        
+        existing_stats['processes'][str(pid)] = {
+            'import_hits': _import_hits,
+            'import_misses': _import_misses,
+            'import_lcp_lengths': _import_lcp_lengths.copy(),
+            'registry_size': len(_registry._registry),
+            'prefix_index_size': len(_prefix_index._hash_to_length),
+        }
+        
+        # Atomic write: write to temp then rename
+        temp_file = stats_file + '.tmp'
+        with open(temp_file, 'w') as f:
+            json.dump(existing_stats, f)
+        os.replace(temp_file, stats_file)
+    except Exception as e:
+        logger.warning(f"Failed to write stats to file: {e}")
+
+
+def _read_stats_from_file_raw():
+    """Read raw stats file (returns dict with per-process stats)."""
+    try:
+        stats_file = _get_stats_file_path()
+        if not os.path.exists(stats_file):
+            return {'processes': {}}
+        
+        with open(stats_file, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to read stats from file: {e}")
+        return {'processes': {}}
+
+
+def _read_stats_from_file():
+    """Read stats from file and aggregate across all processes.
+    
+    Returns aggregated stats summing counts from all worker processes.
+    """
+    try:
+        raw_stats = _read_stats_from_file_raw()
+        processes = raw_stats.get('processes', {})
+        
+        if not processes:
+            return {
+                'import_hits': 0,
+                'import_misses': 0,
+                'import_lcp_lengths': [],
+                'registry_size': 0,
+                'prefix_index_size': 0,
+            }
+        
+        # Aggregate stats from all processes
+        total_hits = 0
+        total_misses = 0
+        all_lcp_lengths = []
+        max_registry_size = 0
+        max_prefix_index_size = 0
+        
+        for pid, proc_stats in processes.items():
+            total_hits += proc_stats.get('import_hits', 0)
+            total_misses += proc_stats.get('import_misses', 0)
+            all_lcp_lengths.extend(proc_stats.get('import_lcp_lengths', []))
+            max_registry_size = max(max_registry_size, proc_stats.get('registry_size', 0))
+            max_prefix_index_size = max(max_prefix_index_size, proc_stats.get('prefix_index_size', 0))
+        
+        return {
+            'import_hits': total_hits,
+            'import_misses': total_misses,
+            'import_lcp_lengths': all_lcp_lengths,
+            'registry_size': max_registry_size,
+            'prefix_index_size': max_prefix_index_size,
+        }
+    except Exception as e:
+        logger.warning(f"Failed to aggregate stats from file: {e}")
+        return {
+            'import_hits': 0,
+            'import_misses': 0,
+            'import_lcp_lengths': [],
+            'registry_size': 0,
+            'prefix_index_size': 0,
+        }
+
 
 def set_min_prefix_length(min_length: int):
     """Set the minimum prefix length for import.
@@ -31,6 +170,69 @@ def set_min_prefix_length(min_length: int):
 def get_min_prefix_length() -> int:
     """Get the current minimum prefix length."""
     return _MIN_PREFIX_LENGTH
+
+
+def get_stats() -> dict:
+    """Get statistics about imports and exports.
+    
+    Reads from both in-process stats and file-based stats (for cross-process access).
+    In multiprocessing scenarios, file-based stats aggregate across all worker processes.
+    
+    Returns:
+        Dictionary with statistics:
+        - import_hits: Number of successful imports (aggregated across processes)
+        - import_misses: Number of failed import attempts (aggregated)
+        - import_lcp_lengths: List of LCP lengths for successful imports (combined)
+        - registry_size: Maximum registry size across processes
+        - prefix_index_size: Maximum prefix index size across processes
+    """
+    global _import_hits, _import_misses, _import_lcp_lengths
+    
+    # Get in-process stats
+    local_stats = {
+        'import_hits': _import_hits,
+        'import_misses': _import_misses,
+        'import_lcp_lengths': _import_lcp_lengths.copy(),
+        'registry_size': len(_registry._registry),
+        'prefix_index_size': len(_prefix_index._hash_to_length),
+    }
+    
+    # Read aggregated stats from file (includes all worker processes)
+    file_stats = _read_stats_from_file()
+    
+    # File stats are aggregated across all worker processes (summed for hits/misses)
+    # Use file stats as primary source since hooks run in worker processes
+    # Also merge with local stats to handle cases where hooks might run in main process
+    merged_stats = {
+        # File stats are aggregated (summed), so use them directly
+        # They will be 0 if no worker processes have written yet
+        'import_hits': file_stats['import_hits'],
+        'import_misses': file_stats['import_misses'],
+        # Combine LCP lengths from both sources (deduplicate)
+        'import_lcp_lengths': list(set(local_stats['import_lcp_lengths'] + file_stats.get('import_lcp_lengths', []))),
+        # For sizes, use max (one process might have more entries than others)
+        'registry_size': max(local_stats['registry_size'], file_stats['registry_size']),
+        'prefix_index_size': max(local_stats['prefix_index_size'], file_stats['prefix_index_size']),
+    }
+    
+    return merged_stats
+
+
+def reset_stats():
+    """Reset statistics counters."""
+    global _import_hits, _import_misses, _import_lcp_lengths
+    _import_hits = 0
+    _import_misses = 0
+    _import_lcp_lengths = []
+    # Also reset file-based stats
+    try:
+        stats_file = _get_stats_file_path()
+        if os.path.exists(stats_file):
+            os.remove(stats_file)
+        # Write empty stats
+        _write_stats_to_file()
+    except Exception as e:
+        logger.warning(f"Failed to reset file stats: {e}")
 
 
 class VLLMImportCtx(TypedDict):
@@ -87,6 +289,9 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         lcp_result = _prefix_index.find_lcp(tokens)
         if lcp_result is None:
             logger.debug(f"No LCP found for tokens (length={len(tokens)})")
+            global _import_misses
+            _import_misses += 1
+            _write_stats_to_file()
             return None
         
         lcp_len, prefix_hash = lcp_result
@@ -94,12 +299,16 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         # Check if LCP meets minimum length requirement
         if lcp_len < min_prefix:
             logger.debug(f"LCP length {lcp_len} < min_prefix {min_prefix}, skipping import")
+            _import_misses += 1
+            _write_stats_to_file()
             return None
         
         # Lookup handle in registry
         handle = _registry.lookup(compat, prefix_hash)
         if handle is None:
             logger.debug(f"No handle found for compat={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...")
+            _import_misses += 1
+            _write_stats_to_file()
             return None
         
         logger.info(f"Found KV cache match: lcp_len={lcp_len}, src_dev={handle.device_id}, dst_dev={device_id}")
@@ -133,6 +342,14 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         )
         
         logger.info(f"Successfully imported {lcp_len} tokens from GPU {handle.device_id} to GPU {device_id}")
+        
+        # Track successful import
+        global _import_hits, _import_lcp_lengths
+        _import_hits += 1
+        _import_lcp_lengths.append(lcp_len)
+        # Write to file for cross-process access
+        _write_stats_to_file()
+        
         return (lcp_len, dst_alloc)
         
     except Exception as e:
@@ -191,6 +408,9 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         
         # Register in registry
         _registry.register(compat, prefix_hash, handle)
+        
+        # Update file stats (registry size changed)
+        _write_stats_to_file()
         
         logger.info(f"Exported KV cache: length={length}, device={device_id}, prefix_hash={prefix_hash.hex()[:8]}...")
         

@@ -252,8 +252,91 @@ Destination checksum: <hash>
 
 ### vLLM Integration Demo
 
-The `vllm_dual_gpu_demo.py` script demonstrates the full integration with vLLM (requires the `vllm-kvm-dev` fork):
+The `vllm_dual_gpu_demo.py` script demonstrates the full integration with vLLM (requires the `vllm-kvm-dev` fork).
+
+Run with default settings (kv-marketplace enabled):
 
 ```bash
-python kv_marketplace/examples/vllm_dual_gpu_demo.py
+python kv_marketplace/examples/vllm_dual_gpu_demo.py --model gpt2
+```
+
+Run a side-by-side comparison with and without kv-marketplace:
+
+```bash
+python kv_marketplace/examples/vllm_dual_gpu_demo.py --model gpt2 --compare
+```
+
+Use custom system prompts and user prompts:
+
+```bash
+python kv_marketplace/examples/vllm_dual_gpu_demo.py \
+    --model gpt2 \
+    --system-prompt "You are a helpful AI assistant specialized in explaining complex topics." \
+    --user-prompts "What is quantum computing?" "Explain neural networks" "How does encryption work?"
+```
+
+Advanced options:
+
+```bash
+python kv_marketplace/examples/vllm_dual_gpu_demo.py \
+    --model gpt2 \
+    --num-runs 5 \
+    --kv-min-prefix 64 \
+    --gpu-memory-utilization 0.9 \
+    --tensor-parallel-size 2 \
+    --max-model-len 2048 \
+    --compare
+```
+
+The demo will display:
+
+1. Benchmark runs with per-run statistics:
+   * Average latency per request
+   * Total time
+   * Throughput (requests/second)
+   * Registry size (number of cached prefixes)
+   * Prefix index size
+   * Import hits and misses (when kv-marketplace is enabled)
+   * Average LCP length for successful imports
+
+2. Comparison chart (when using `--compare`):
+   * Side-by-side metrics with and without kv-marketplace
+   * Improvement percentages for latency and throughput
+   * Import statistics
+
+Example output snippet:
+```
+================================================================================
+  Benchmark: WITH kv-marketplace
+================================================================================
+Model: gpt2
+System prompt length: 78 chars
+Number of user prompts: 5
+Number of runs: 3
+KV Marketplace: True
+KV Min Prefix: 64
+
+Initializing LLM...
+LLM initialized successfully!
+
+Run 1/3...
+  Average latency: 0.1234s
+  Total time: 0.6170s
+  Throughput: 8.10 req/s
+  Registry size: 5
+  Prefix index size: 5
+  Import hits: 4
+  Import misses: 1
+  Average LCP length: 128.5 tokens
+
+================================================================================
+  COMPARISON CHART
+================================================================================
+
+Metric               Without kv-mkt        With kv-mkt          Improvement
+--------------------------------------------------------------------------------
+Average Latency      0.1500s              0.1234s             -17.7%
+Throughput          6.67 req/s           8.10 req/s          +21.4%
+Import Hits         0                    4                   N/A
+Avg LCP Length      0.0 tokens           128.5 tokens        N/A
 ```
