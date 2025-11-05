@@ -3,6 +3,8 @@
 #include <unordered_map>
 #include <mutex>
 #include <vector>
+#include <string>
+#include <cstdio>
 
 // Helper to set device and save previous device
 static bool set_device(int d, int& prev) {
@@ -76,6 +78,11 @@ bool ensure_peer_access(int src_dev, int dst_dev) {
     if (err == cudaErrorPeerAccessAlreadyEnabled) {
         cudaGetLastError(); // Clear the error
         success = true;
+    } else if (err == cudaErrorPeerAccessUnsupported) {
+        // Peer access not supported (e.g., different architectures, no NVLink)
+        // This is a permanent condition, so cache as false
+        cudaGetLastError(); // Clear the error
+        success = false;
     } else if (err == cudaSuccess) {
         success = true;
     }
@@ -274,6 +281,57 @@ void synchronize_stream(uintptr_t stream_ptr) {
     }
 }
 
+// Get CUDA device UUID as a string
+// Returns empty string on error
+std::string get_device_uuid(int device_id) {
+    int prev;
+    if (!set_device(device_id, prev)) {
+        return "";
+    }
+    
+    cudaDeviceProp prop;
+    cudaError_t err = cudaGetDeviceProperties(&prop, device_id);
+    cudaSetDevice(prev);
+    
+    if (err != cudaSuccess) {
+        return "";
+    }
+    
+    // UUID is stored as char[16] in cudaDeviceProp
+    // Format as hex string
+    char uuid_str[64];
+    snprintf(uuid_str, sizeof(uuid_str),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             (unsigned char)prop.uuid.bytes[0], (unsigned char)prop.uuid.bytes[1],
+             (unsigned char)prop.uuid.bytes[2], (unsigned char)prop.uuid.bytes[3],
+             (unsigned char)prop.uuid.bytes[4], (unsigned char)prop.uuid.bytes[5],
+             (unsigned char)prop.uuid.bytes[6], (unsigned char)prop.uuid.bytes[7],
+             (unsigned char)prop.uuid.bytes[8], (unsigned char)prop.uuid.bytes[9],
+             (unsigned char)prop.uuid.bytes[10], (unsigned char)prop.uuid.bytes[11],
+             (unsigned char)prop.uuid.bytes[12], (unsigned char)prop.uuid.bytes[13],
+             (unsigned char)prop.uuid.bytes[14], (unsigned char)prop.uuid.bytes[15]);
+    
+    return std::string(uuid_str);
+}
+
+// Map UUID to local device ordinal
+// Returns -1 if not found
+int uuid_to_local_ordinal(const std::string& uuid) {
+    int num_devices;
+    if (cudaGetDeviceCount(&num_devices) != cudaSuccess) {
+        return -1;
+    }
+    
+    for (int i = 0; i < num_devices; i++) {
+        std::string dev_uuid = get_device_uuid(i);
+        if (dev_uuid == uuid) {
+            return i;
+        }
+    }
+    
+    return -1;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ensure_peer_access", &ensure_peer_access,
           "Enable peer access between two CUDA devices");
@@ -289,4 +347,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Make a stream wait for an event (non-blocking from host)");
     m.def("destroy_event", &destroy_event,
           "Return a CUDA event to pool for reuse (or destroy if pool full)");
+    m.def("get_device_uuid", &get_device_uuid,
+          "Get CUDA device UUID as string for a given device ordinal");
+    m.def("uuid_to_local_ordinal", &uuid_to_local_ordinal,
+          "Map UUID to local device ordinal, returns -1 if not found");
 }

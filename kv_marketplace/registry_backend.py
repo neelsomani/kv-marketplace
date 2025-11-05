@@ -150,24 +150,31 @@ class FileBasedRegistryBackend(RegistryBackend):
     
     def _serialize_handle(self, handle: 'KVHandle') -> Dict:
         """Serialize KVHandle to JSON-serializable dict."""
-        return {
+        result = {
             'device_id': handle.device_id,
             'k_ptrs': handle.k_ptrs,
             'v_ptrs': handle.v_ptrs,
             'length': handle.length,
             'layout_meta': handle.layout_meta,
         }
+        # Include device_uuid if present (for UUID-based device identity)
+        if hasattr(handle, 'device_uuid') and handle.device_uuid:
+            result['device_uuid'] = handle.device_uuid
+        return result
     
     def _deserialize_handle(self, data: Dict) -> 'KVHandle':
         """Deserialize dict to KVHandle."""
         # Import here to avoid circular dependency
         from .registry import KVHandle
+        # Include device_uuid if present in serialized data
+        device_uuid = data.get('device_uuid', None)
         return KVHandle(
             device_id=data['device_id'],
             k_ptrs=data['k_ptrs'],
             v_ptrs=data['v_ptrs'],
             length=data['length'],
             layout_meta=data['layout_meta'],
+            device_uuid=device_uuid,  # Restore UUID if present
         )
     
     def _make_key(self, compat: 'KVCompat', prefix_hash: bytes) -> str:

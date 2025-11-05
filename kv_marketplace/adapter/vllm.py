@@ -10,7 +10,9 @@ from ..compat import KVCompat
 from ..registry import KVRegistry, KVHandle
 from ..registry_backend import FileBasedRegistryBackend
 from ..prefix_index import PrefixIndex
+from ..prefix_index_backend import FileBasedPrefixIndex
 from ..transport.p2p import PeerCopy
+from ..transport import p2p_cuda
 
 logger = logging.getLogger(__name__)
 # Set kv-marketplace logger to INFO to avoid debug overhead in hot paths
@@ -24,11 +26,12 @@ _USE_FILE_BACKEND = os.environ.get('KV_MARKETPLACE_FILE_BACKEND', '').lower() in
 # Global instances for registry and prefix index
 # Use file-based backend if enabled for multi-process sharing on same machine
 if _USE_FILE_BACKEND:
-    logger.info("kv-marketplace: Using file-based registry backend for multi-process sharing")
+    logger.info("kv-marketplace: Using file-based registry and prefix index backends for multi-process sharing")
     _registry = KVRegistry(backend=FileBasedRegistryBackend())
+    _prefix_index = FileBasedPrefixIndex()  # File-based prefix index for cross-process persistence
 else:
     _registry = KVRegistry()  # Default: in-process backend
-_prefix_index = PrefixIndex()
+    _prefix_index = PrefixIndex()  # Default: in-process prefix index
 
 # Default minimum prefix length (can be overridden by vLLM flags)
 _MIN_PREFIX_LENGTH = 64
@@ -37,6 +40,8 @@ _MIN_PREFIX_LENGTH = 64
 _import_hits = 0
 _import_misses = 0
 _import_lcp_lengths = []
+_local_hits = 0  # Cache hits on same GPU (skipped by marketplace)
+_cross_hits = 0  # Cross-GPU cache hits (marketplace imports)
 
 # File-based stats sharing for multiprocessing
 _stats_file = None
@@ -93,6 +98,8 @@ def _write_stats_to_file():
             'import_hits': _import_hits,
             'import_misses': _import_misses,
             'import_lcp_lengths': _import_lcp_lengths.copy(),
+            'local_hits': _local_hits,
+            'cross_hits': _cross_hits,
             'registry_size': _registry.size(),
             'prefix_index_size': len(_prefix_index._hash_to_length),
         }
@@ -133,6 +140,8 @@ def _read_stats_from_file():
             return {
                 'import_hits': 0,
                 'import_misses': 0,
+                'local_hits': 0,
+                'cross_hits': 0,
                 'import_lcp_lengths': [],
                 'registry_size': 0,
                 'prefix_index_size': 0,
@@ -141,6 +150,8 @@ def _read_stats_from_file():
         # Aggregate stats from all processes
         total_hits = 0
         total_misses = 0
+        total_local_hits = 0
+        total_cross_hits = 0
         all_lcp_lengths = []
         max_registry_size = 0
         max_prefix_index_size = 0
@@ -148,6 +159,8 @@ def _read_stats_from_file():
         for pid, proc_stats in processes.items():
             total_hits += proc_stats.get('import_hits', 0)
             total_misses += proc_stats.get('import_misses', 0)
+            total_local_hits += proc_stats.get('local_hits', 0)
+            total_cross_hits += proc_stats.get('cross_hits', 0)
             all_lcp_lengths.extend(proc_stats.get('import_lcp_lengths', []))
             max_registry_size = max(max_registry_size, proc_stats.get('registry_size', 0))
             max_prefix_index_size = max(max_prefix_index_size, proc_stats.get('prefix_index_size', 0))
@@ -155,6 +168,8 @@ def _read_stats_from_file():
         return {
             'import_hits': total_hits,
             'import_misses': total_misses,
+            'local_hits': total_local_hits,
+            'cross_hits': total_cross_hits,
             'import_lcp_lengths': all_lcp_lengths,
             'registry_size': max_registry_size,
             'prefix_index_size': max_prefix_index_size,
@@ -165,6 +180,8 @@ def _read_stats_from_file():
             'import_hits': 0,
             'import_misses': 0,
             'import_lcp_lengths': [],
+            'local_hits': 0,
+            'cross_hits': 0,
             'registry_size': 0,
             'prefix_index_size': 0,
         }
@@ -195,16 +212,20 @@ def get_stats() -> dict:
         Dictionary with statistics:
         - import_hits: Number of successful imports (aggregated across processes)
         - import_misses: Number of failed import attempts (aggregated)
+        - local_hits: Number of same-GPU cache hits (skipped by marketplace)
+        - cross_hits: Number of cross-GPU cache hits (marketplace imports)
         - import_lcp_lengths: List of LCP lengths for successful imports (combined)
         - registry_size: Maximum registry size across processes
         - prefix_index_size: Maximum prefix index size across processes
     """
-    global _import_hits, _import_misses, _import_lcp_lengths
+    global _import_hits, _import_misses, _import_lcp_lengths, _local_hits, _cross_hits
     
     # Get in-process stats
     local_stats = {
         'import_hits': _import_hits,
         'import_misses': _import_misses,
+        'local_hits': _local_hits,
+        'cross_hits': _cross_hits,
         'import_lcp_lengths': _import_lcp_lengths.copy(),
         'registry_size': len(_registry._registry),
         'prefix_index_size': len(_prefix_index._hash_to_length),
@@ -221,6 +242,8 @@ def get_stats() -> dict:
         # They will be 0 if no worker processes have written yet
         'import_hits': file_stats['import_hits'],
         'import_misses': file_stats['import_misses'],
+        'local_hits': file_stats.get('local_hits', 0),
+        'cross_hits': file_stats.get('cross_hits', 0),
         # Combine LCP lengths from both sources (deduplicate)
         'import_lcp_lengths': list(set(local_stats['import_lcp_lengths'] + file_stats.get('import_lcp_lengths', []))),
         # For sizes, use max (one process might have more entries than others)
@@ -329,44 +352,60 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             _write_stats_to_file()
             return None
         
-        logger.info(f"kv-marketplace: Registry lookup succeeded! handle.device_id={handle.device_id}, current_device_id={device_id}, lcp_len={lcp_len}")
-        # Check if handle has valid GPU pointers (not just block IDs)
-        # GPU pointers are typically large integers (memory addresses)
-        # Block IDs are small integers (0 to num_blocks)
-        # Note: We continue anyway - might still work if it's actually a valid small pointer
+        logger.info(f"kv-marketplace: Registry lookup succeeded! handle.device_id={handle.device_id}, handle.device_uuid={getattr(handle, 'device_uuid', None)}, current_device_id={device_id}, lcp_len={lcp_len}")
         
-        # logger.debug(f"Found KV cache match: lcp_len={lcp_len}, src_dev={handle.device_id}, dst_dev={device_id}")
+        # Get current device UUID for comparison
+        current_device_uuid = p2p_cuda.get_device_uuid(device_id) if hasattr(p2p_cuda, 'get_device_uuid') else None
         
-        # Optimization: If cache hit is on the same GPU, skip marketplace import
-        # vLLM's native cache management can handle same-GPU reuse more efficiently
-        # without the overhead of explicit copying
-        if handle.device_id == device_id:
+        # Check if cache hit is on the same GPU using UUID (globally unique)
+        # If UUID is not available, fall back to device_id comparison (legacy mode)
+        is_same_gpu = False
+        if hasattr(handle, 'device_uuid') and handle.device_uuid and current_device_uuid:
+            # Use UUID comparison (reliable across processes)
+            is_same_gpu = (handle.device_uuid == current_device_uuid)
+        else:
+            # Fallback to device_id comparison (legacy mode, may fail across processes)
+            is_same_gpu = (handle.device_id == device_id)
+        
+        if is_same_gpu:
             # Same GPU - let vLLM's native cache management handle local reuse
             # This avoids unnecessary memory allocation and copying overhead
             logger.info(f"kv-marketplace: Cache hit on same GPU {device_id} (lcp_len={lcp_len}), skipping marketplace import (let vLLM handle local reuse)")
+            global _local_hits
+            _local_hits += 1
+            _write_stats_to_file()
             return None
         
+        # Cross-GPU cache hit - map source UUID to local ordinal for P2P operations
+        src_dev_local = device_id  # Default to current device_id (will be wrong if UUID mapping fails)
+        if hasattr(handle, 'device_uuid') and handle.device_uuid:
+            # Map source UUID to local ordinal
+            src_dev_local = p2p_cuda.uuid_to_local_ordinal(handle.device_uuid)
+            if src_dev_local < 0:
+                logger.warning(f"Could not map source UUID {handle.device_uuid} to local ordinal, using handle.device_id={handle.device_id}")
+                src_dev_local = handle.device_id  # Fallback to stored device_id
+        
         # Cross-GPU cache hit - proceed with marketplace import
-        logger.info(f"kv-marketplace: Cross-GPU cache hit found! src_dev={handle.device_id}, dst_dev={device_id}, lcp_len={lcp_len}, proceeding with import")
+        logger.info(f"kv-marketplace: Cross-GPU cache hit found! src_dev={src_dev_local} (UUID={getattr(handle, 'device_uuid', None)}), dst_dev={device_id}, lcp_len={lcp_len}, proceeding with import")
         
         # Allocate destination KV cache
         dst_alloc = ctx['alloc_prefix'](lcp_len)
         
-        # Check peer access requirement
+        # Check peer access requirement using mapped local ordinals
         # Note: PeerCopy.ensure_peer_access has C++-level caching, so no need to cache here
         allow_pcie = ctx.get('allow_pcie', False)
-        has_peer_access = PeerCopy.ensure_peer_access(handle.device_id, device_id)
+        has_peer_access = PeerCopy.ensure_peer_access(src_dev_local, device_id)
         
         if not has_peer_access:
             if not allow_pcie:
                 logger.warning(
-                    f"Peer access not available between GPU {handle.device_id} and GPU {device_id}, "
+                    f"Peer access not available between GPU {src_dev_local} and GPU {device_id}, "
                     f"and --kv-allow-pcie not set. Skipping import."
                 )
                 return None
             else:
                 logger.warning(
-                    f"Peer access not available between GPU {handle.device_id} and GPU {device_id}, "
+                    f"Peer access not available between GPU {src_dev_local} and GPU {device_id}, "
                     f"but --kv-allow-pcie is set. Attempting import anyway (may fail or use slower path)."
                 )
         
@@ -379,12 +418,13 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             pass
         
         # Copy KV tensors from source to destination with coalescing
+        # Use mapped local ordinals (src_dev_local, device_id) for correct P2P routing
         # Pass the stream directly - PeerCopy.copy_kv accepts int (CUDA stream pointer)
         PeerCopy.copy_kv(
             dst_dev=device_id,
             dst_k_ptrs=dst_alloc['k_ptrs'],
             dst_v_ptrs=dst_alloc['v_ptrs'],
-            src_dev=handle.device_id,
+            src_dev=src_dev_local,  # Use mapped local ordinal, not handle.device_id
             src_k_ptrs=handle.k_ptrs,
             src_v_ptrs=handle.v_ptrs,
             n_layers=layout['n_layers'],
@@ -404,11 +444,12 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         # This ensures the imported KV cache is fully materialized before vLLM continues
         PeerCopy.synchronize_stream(ctx['stream'])
         
-        logger.info(f"kv-marketplace: Successfully imported {lcp_len} tokens from GPU {handle.device_id} to GPU {device_id} (coalesced segments, synchronized)")
+        logger.info(f"kv-marketplace: Successfully imported {lcp_len} tokens from GPU {src_dev_local} to GPU {device_id} (coalesced segments, synchronized)")
         
         # Track successful import
-        global _import_hits, _import_lcp_lengths
+        global _import_hits, _import_lcp_lengths, _cross_hits
         _import_hits += 1
+        _cross_hits += 1
         _import_lcp_lengths.append(lcp_len)
         # Write to file for cross-process access
         _write_stats_to_file()
@@ -476,9 +517,18 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         # Compute prefix hash and insert into prefix index
         prefix_hash = _prefix_index.insert(prefix_tokens)
         
+        # Get globally unique device UUID (for cross-process device identity)
+        # This ensures correct device identification even when CUDA_VISIBLE_DEVICES
+        # makes each process see its GPU as device 0
+        device_uuid = p2p_cuda.get_device_uuid(device_id)
+        if not device_uuid:
+            # Fallback: use device_id as string (legacy mode)
+            logger.warning(f"Could not get UUID for device {device_id}, using device_id as fallback")
+            device_uuid = None
+        
         # Build KVHandle from context
         handle = KVHandle(
-            device_id=device_id,
+            device_id=device_id,  # Local ordinal (for backward compatibility)
             k_ptrs=k_ptrs,
             v_ptrs=v_ptrs,
             length=length,
@@ -488,7 +538,8 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
                 'head_dim': layout['head_dim'],
                 'page_size': layout['page_size'],
                 **layout.get('strides', {})
-            }
+            },
+            device_uuid=device_uuid  # Globally unique UUID
         )
         
         # Register in registry
