@@ -8,13 +8,23 @@ from typing import Callable, Optional, Tuple, List, TypedDict
 from .types import KVLayout, AllocatedKV
 from ..compat import KVCompat
 from ..registry import KVRegistry, KVHandle
+from ..registry_backend import FileBasedRegistryBackend
 from ..prefix_index import PrefixIndex
 from ..transport.p2p import PeerCopy
 
 logger = logging.getLogger(__name__)
 
+# Detect if we should use file-based backend for multi-process sharing
+# Use environment variable to enable, or auto-detect based on data parallelism
+_USE_FILE_BACKEND = os.environ.get('KV_MARKETPLACE_FILE_BACKEND', '').lower() in ('1', 'true', 'yes')
+
 # Global instances for registry and prefix index
-_registry = KVRegistry()
+# Use file-based backend if enabled for multi-process sharing on same machine
+if _USE_FILE_BACKEND:
+    logger.info("kv-marketplace: Using file-based registry backend for multi-process sharing")
+    _registry = KVRegistry(backend=FileBasedRegistryBackend())
+else:
+    _registry = KVRegistry()  # Default: in-process backend
 _prefix_index = PrefixIndex()
 
 # Default minimum prefix length (can be overridden by vLLM flags)
@@ -80,7 +90,7 @@ def _write_stats_to_file():
             'import_hits': _import_hits,
             'import_misses': _import_misses,
             'import_lcp_lengths': _import_lcp_lengths.copy(),
-            'registry_size': len(_registry._registry),
+            'registry_size': _registry.size(),
             'prefix_index_size': len(_prefix_index._hash_to_length),
         }
         
@@ -307,7 +317,7 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             return None
         
         # Lookup handle in registry
-        logger.info(f"kv-marketplace before_prefill: Looking up handle in registry (size={len(_registry._registry)}, compat_hash={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...)")
+        logger.info(f"kv-marketplace before_prefill: Looking up handle in registry (size={_registry.size()}, compat_hash={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...)")
         handle = _registry.lookup(compat, prefix_hash)
         if handle is None:
             logger.info(f"kv-marketplace before_prefill: No handle found in registry for compat/prefix_hash")

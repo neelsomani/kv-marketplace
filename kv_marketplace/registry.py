@@ -1,7 +1,8 @@
-"""KVRegistry: in-process map (compat, prefix hash) → KVHandle."""
+"""KVRegistry: map (compat, prefix hash) → KVHandle with pluggable backends."""
 
-from typing import Dict, Optional, Tuple
+from typing import Optional
 from .compat import KVCompat
+from .registry_backend import RegistryBackend, InProcessRegistryBackend
 
 
 class KVHandle:
@@ -29,11 +30,27 @@ class KVRegistry:
     """Registry mapping (compat, prefix_hash) to KVHandle.
     
     Stores exported KV caches for reuse by matching requests.
+    Uses a pluggable backend for storage (in-process, file-based, or distributed).
+    
+    Example:
+        # Default: in-process backend
+        registry = KVRegistry()
+        
+        # File-based for multi-process on same machine
+        from kv_marketplace.registry_backend import FileBasedRegistryBackend
+        backend = FileBasedRegistryBackend()
+        registry = KVRegistry(backend=backend)
     """
     
-    def __init__(self):
-        """Initialize an empty registry."""
-        self._registry: Dict[Tuple[KVCompat, bytes], KVHandle] = {}
+    def __init__(self, backend: Optional[RegistryBackend] = None):
+        """Initialize registry with a backend.
+        
+        Args:
+            backend: Registry backend to use. If None, uses InProcessRegistryBackend.
+        """
+        if backend is None:
+            backend = InProcessRegistryBackend()
+        self._backend = backend
     
     def register(self, compat: KVCompat, prefix_hash: bytes, handle: KVHandle):
         """Register a KV handle for a given compatibility and prefix.
@@ -43,8 +60,7 @@ class KVRegistry:
             prefix_hash: Hash of the token prefix
             handle: KV handle to register
         """
-        key = (compat, prefix_hash)
-        self._registry[key] = handle
+        self._backend.register(compat, prefix_hash, handle)
     
     def lookup(self, compat: KVCompat, prefix_hash: bytes) -> Optional[KVHandle]:
         """Look up a KV handle by compatibility and prefix hash.
@@ -56,8 +72,7 @@ class KVRegistry:
         Returns:
             KVHandle if found, None otherwise
         """
-        key = (compat, prefix_hash)
-        return self._registry.get(key)
+        return self._backend.lookup(compat, prefix_hash)
     
     def remove(self, compat: KVCompat, prefix_hash: bytes):
         """Remove a registered KV handle.
@@ -66,6 +81,25 @@ class KVRegistry:
             compat: Compatibility configuration
             prefix_hash: Hash of the token prefix
         """
-        key = (compat, prefix_hash)
-        self._registry.pop(key, None)
+        self._backend.remove(compat, prefix_hash)
+    
+    def size(self) -> int:
+        """Get the number of registered handles.
+        
+        Returns:
+            Number of registered handles
+        """
+        return self._backend.size()
+    
+    @property
+    def _registry(self):
+        """Backward compatibility: access internal dict for in-process backend.
+        
+        Note: This property is deprecated. Use size() method instead.
+        """
+        if isinstance(self._backend, InProcessRegistryBackend):
+            return self._backend._registry
+        # For other backends, return a dummy dict to avoid breaking existing code
+        # that accesses _registry directly
+        return {}
 

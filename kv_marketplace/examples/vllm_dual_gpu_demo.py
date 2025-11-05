@@ -8,6 +8,9 @@ NOTE: vLLM uses multiprocessing with worker processes. Stats are automatically
 aggregated across all processes using a file-based system, so the printed
 statistics are accurate. The stats file is located at:
 /tmp/kv_marketplace_stats/stats.json
+
+For multi-GPU setups (data parallelism), the registry is automatically shared
+via file-based backend when KV_MARKETPLACE_FILE_BACKEND=1 is set.
 """
 
 import sys
@@ -37,6 +40,18 @@ except ImportError as e:
 
 # Add parent directory to path (after vLLM imports to avoid conflicts)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
+# Check for multi-GPU setup BEFORE importing adapter
+# This allows the adapter to use file-based backend if needed
+# The adapter initializes the registry at module import time, so we need to set
+# the env var before importing
+try:
+    import torch
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        os.environ['KV_MARKETPLACE_FILE_BACKEND'] = '1'
+        print(f"Detected {torch.cuda.device_count()} GPUs, enabling file-based registry backend for cross-process sharing")
+except ImportError:
+    pass
 
 # LLM import will be done lazily to avoid import-time issues
 LLM = None
@@ -168,6 +183,9 @@ def run_benchmark(
     
     # Create prompts with shared prefix
     prompts = create_shared_prefix_prompts(system_prompt, user_prompts)
+    
+    # Note: File-based backend is enabled at module import time if multiple GPUs detected
+    # This allows sharing registry across processes on the same machine
     
     # Reset stats if kv-marketplace is enabled
     if kv_marketplace and STATS_AVAILABLE:
