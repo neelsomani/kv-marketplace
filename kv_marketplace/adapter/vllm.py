@@ -70,6 +70,19 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         layout = ctx['layout']
         min_prefix = get_min_prefix_length()
         
+        # Convert compat dict to KVCompat if needed
+        if not isinstance(compat, KVCompat):
+            if isinstance(compat, dict):
+                compat = KVCompat(
+                    model_params=compat.get("model_params", {}),
+                    tokenizer_config=compat.get("tokenizer_config", {}),
+                    rope_config=compat.get("rope_config", {}),
+                    layout_config=compat.get("kv_layout", {})
+                )
+            else:
+                logger.error(f"Invalid compat type: {type(compat)}")
+                return None
+        
         # Find longest common prefix using prefix index
         lcp_result = _prefix_index.find_lcp(tokens)
         if lcp_result is None:
@@ -141,6 +154,19 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         device_id = ctx['device_id']
         kv_pages = ctx['kv_pages']
         layout = ctx['layout']
+        
+        # Convert compat dict to KVCompat if needed
+        if not isinstance(compat, KVCompat):
+            if isinstance(compat, dict):
+                compat = KVCompat(
+                    model_params=compat.get("model_params", {}),
+                    tokenizer_config=compat.get("tokenizer_config", {}),
+                    rope_config=compat.get("rope_config", {}),
+                    layout_config=compat.get("kv_layout", {})
+                )
+            else:
+                logger.error(f"Invalid compat type: {type(compat)}")
+                return
         
         # Only export the prefix up to length
         prefix_tokens = tokens[:length]
