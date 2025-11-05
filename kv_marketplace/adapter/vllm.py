@@ -392,12 +392,19 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         k_ptrs = kv_pages.get('k_ptrs', [])
         v_ptrs = kv_pages.get('v_ptrs', [])
         
+        logger.debug(
+            f"kv-marketplace after_prefill: length={length}, device_id={device_id}, "
+            f"k_ptrs={len(k_ptrs)}, v_ptrs={len(v_ptrs)}, "
+            f"k_ptrs_sample={k_ptrs[:5] if k_ptrs else []}, "
+            f"v_ptrs_sample={v_ptrs[:5] if v_ptrs else []}"
+        )
+        
         # If pointers are empty, we can't export (get_prefill_pages may have failed)
         if not k_ptrs or not v_ptrs:
             logger.warning(
                 f"KV cache pointers are empty for export: length={length}, "
                 f"k_ptrs={len(k_ptrs)}, v_ptrs={len(v_ptrs)}. "
-                f"This may indicate get_prefill_pages needs implementation."
+                f"This may indicate get_prefill_pages needs implementation or blocks aren't available yet."
             )
             return
         
