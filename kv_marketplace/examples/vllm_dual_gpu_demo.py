@@ -64,33 +64,109 @@ except ImportError:
     STATS_AVAILABLE = False
 
 
+def create_prefixes_from_system_prompt(system_prompt: str, num_prefixes: int = 10) -> List[str]:
+    """Split system prompt into N different prefixes by splitting on '. '.
+    
+    Args:
+        system_prompt: The system prompt to split
+        num_prefixes: Number of prefixes to create
+        
+    Returns:
+        List of prefixes (each is a cumulative prefix up to that sentence)
+    """
+    sentences = system_prompt.split('. ')
+    
+    # If we have fewer sentences than requested prefixes, use what we have
+    if len(sentences) < num_prefixes:
+        num_prefixes = len(sentences)
+    
+    prefixes = []
+    current_prefix = ""
+    for i in range(num_prefixes):
+        if i == 0:
+            current_prefix = sentences[i]
+        else:
+            current_prefix = current_prefix + '. ' + sentences[i]
+        prefixes.append(current_prefix)
+    
+    return prefixes
+
+
 def create_shared_prefix_prompts(system_prompt: str, user_prompts: List[str]) -> List[str]:
     """Create prompts with shared system prefix."""
     return [f"{system_prompt}\n\nUser: {prompt}\n\nAssistant:" for prompt in user_prompts]
 
 
-def measure_latency(llm, prompts: List[str], sampling_params: SamplingParams) -> Tuple[List[float], List[str]]:
-    """Measure generation latency for prompts.
+def measure_latency_concurrent(llm, prompts: List[str], sampling_params: SamplingParams, 
+                               batch_name: str = "batch") -> Tuple[List[float], List[str], List[int]]:
+    """Measure generation latency for prompts concurrently.
+    
+    Uses ThreadPoolExecutor to send requests concurrently so they can be
+    distributed across GPUs and see each other's caches.
     
     Returns:
-        Tuple of (latencies in seconds, generated texts)
+        Tuple of (latencies in seconds, generated texts, device_ids)
     """
-    latencies = []
-    outputs = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import torch
     
-    for prompt in prompts:
+    def generate_single(prompt: str, prompt_idx: int) -> Tuple[int, float, str]:
+        """Generate for a single prompt and return device_id, latency, output."""
+        # Try to detect which GPU this request goes to by checking current device
+        # Note: This is approximate - vLLM may use different devices internally
+        device_before = torch.cuda.current_device() if torch.cuda.is_available() else -1
+        
         start_time = time.time()
         result = llm.generate([prompt], sampling_params)
         end_time = time.time()
         
-        latency = end_time - start_time
-        latencies.append(latency)
+        device_after = torch.cuda.current_device() if torch.cuda.is_available() else -1
         
+        latency = end_time - start_time
+        
+        output = ""
         if result and len(result) > 0 and len(result[0].outputs) > 0:
-            outputs.append(result[0].outputs[0].text)
-        else:
-            outputs.append("")
+            output = result[0].outputs[0].text
+        
+        # Use device_after as best guess (vLLM may have set it during processing)
+        device_id = device_after if device_after >= 0 else device_before
+        
+        print(f"  {batch_name}: Request {prompt_idx+1} completed on GPU {device_id} (latency: {latency:.4f}s)")
+        
+        return (device_id, latency, output)
     
+    latencies = []
+    outputs = []
+    device_ids = []
+    
+    # Use ThreadPoolExecutor to send requests concurrently
+    with ThreadPoolExecutor(max_workers=len(prompts)) as executor:
+        futures = {executor.submit(generate_single, prompt, idx): idx 
+                  for idx, prompt in enumerate(prompts)}
+        
+        results = {}
+        for future in as_completed(futures):
+            prompt_idx = futures[future]
+            try:
+                device_id, latency, output = future.result()
+                results[prompt_idx] = (device_id, latency, output)
+            except Exception as e:
+                print(f"  Error generating prompt {prompt_idx}: {e}")
+                results[prompt_idx] = (-1, 0.0, "")
+        
+        # Reconstruct in order
+        for idx in range(len(prompts)):
+            device_id, latency, output = results[idx]
+            device_ids.append(device_id)
+            latencies.append(latency)
+            outputs.append(output)
+    
+    return latencies, outputs, device_ids
+
+
+def measure_latency(llm, prompts: List[str], sampling_params: SamplingParams) -> Tuple[List[float], List[str]]:
+    """Measure generation latency for prompts (sequential, for backward compatibility)."""
+    latencies, outputs, _ = measure_latency_concurrent(llm, prompts, sampling_params, "sequential")
     return latencies, outputs
 
 
@@ -181,8 +257,30 @@ def run_benchmark(
     if kv_marketplace:
         print(f"KV Min Prefix: {kv_min_prefix}")
     
-    # Create prompts with shared prefix
-    prompts = create_shared_prefix_prompts(system_prompt, user_prompts)
+    # Create 10 different prefixes from system prompt by splitting on '. '
+    print(f"\nCreating {10} different prefixes from system prompt...")
+    prefixes = create_prefixes_from_system_prompt(system_prompt, num_prefixes=10)
+    print(f"Created {len(prefixes)} prefixes (lengths: {[len(p) for p in prefixes]})")
+    
+    # Create prompts using these prefixes (one user prompt per prefix)
+    # Use first N user prompts, or repeat if needed
+    num_prefixes = len(prefixes)
+    user_prompts_to_use = (user_prompts * ((num_prefixes // len(user_prompts)) + 1))[:num_prefixes]
+    
+    # Phase 1 prompts: each prefix + user prompt
+    phase1_prompts = [f"{prefix}\n\nUser: {user_prompt}\n\nAssistant:" 
+                     for prefix, user_prompt in zip(prefixes, user_prompts_to_use)]
+    
+    # Phase 2 prompts: scrambled prefixes (use random permutation)
+    import random
+    scrambled_prefixes = prefixes.copy()
+    random.seed(42)  # For reproducibility
+    random.shuffle(scrambled_prefixes)
+    phase2_prompts = [f"{prefix}\n\nUser: {user_prompt}\n\nAssistant:" 
+                     for prefix, user_prompt in zip(scrambled_prefixes, user_prompts_to_use)]
+    
+    print(f"\nPhase 1: {len(phase1_prompts)} prompts (warm-up, concurrent)")
+    print(f"Phase 2: {len(phase2_prompts)} prompts (test with scrambled prefixes, concurrent)")
     
     # Note: File-based backend is enabled at module import time if multiple GPUs detected
     # This allows sharing registry across processes on the same machine
@@ -231,22 +329,68 @@ def run_benchmark(
         max_tokens=256,
     )
     
-    # Run benchmark
+    # Run benchmark with two-phase approach
     all_latencies = []
     all_outputs = []
     run_stats = []
     
     for run_idx in range(num_runs):
-        print(f"\nRun {run_idx + 1}/{num_runs}...")
+        print(f"\n{'='*80}")
+        print(f"Run {run_idx + 1}/{num_runs}")
+        print(f"{'='*80}")
         
         # Get stats before run
         stats_before = get_registry_stats()
         if run_idx == 0 and kv_marketplace:
-            print(f"  Stats before run: registry_size={stats_before['registry_size']}, "
+            print(f"Stats before run: registry_size={stats_before['registry_size']}, "
                   f"prefix_index_size={stats_before['prefix_index_size']}")
         
-        # Measure latency
-        latencies, outputs = measure_latency(llm, prompts, sampling_params)
+        # Phase 1: Warm-up (concurrent)
+        print(f"\n--- Phase 1: Warm-up (concurrent, {len(phase1_prompts)} requests) ---")
+        phase1_start = time.time()
+        phase1_latencies, phase1_outputs, phase1_device_ids = measure_latency_concurrent(
+            llm, phase1_prompts, sampling_params, batch_name="Phase1"
+        )
+        phase1_end = time.time()
+        phase1_total_time = phase1_end - phase1_start
+        
+        # Log device distribution for Phase 1
+        device_counts = {}
+        for device_id in phase1_device_ids:
+            device_counts[device_id] = device_counts.get(device_id, 0) + 1
+        print(f"Phase 1 device distribution: {device_counts}")
+        print(f"Phase 1 total time: {phase1_total_time:.4f}s (concurrent)")
+        print(f"Phase 1 average latency: {sum(phase1_latencies) / len(phase1_latencies):.4f}s per request")
+        
+        # Get stats after Phase 1
+        stats_after_phase1 = get_registry_stats()
+        if kv_marketplace:
+            print(f"Stats after Phase 1: registry_size={stats_after_phase1['registry_size']}, "
+                  f"prefix_index_size={stats_after_phase1['prefix_index_size']}")
+        
+        # Small delay to ensure Phase 1 exports complete
+        time.sleep(0.5)
+        
+        # Phase 2: Test with scrambled prefixes (concurrent)
+        print(f"\n--- Phase 2: Test (concurrent, {len(phase2_prompts)} requests with scrambled prefixes) ---")
+        phase2_start = time.time()
+        phase2_latencies, phase2_outputs, phase2_device_ids = measure_latency_concurrent(
+            llm, phase2_prompts, sampling_params, batch_name="Phase2"
+        )
+        phase2_end = time.time()
+        phase2_total_time = phase2_end - phase2_start
+        
+        # Log device distribution for Phase 2
+        device_counts = {}
+        for device_id in phase2_device_ids:
+            device_counts[device_id] = device_counts.get(device_id, 0) + 1
+        print(f"Phase 2 device distribution: {device_counts}")
+        print(f"Phase 2 total time: {phase2_total_time:.4f}s (concurrent)")
+        print(f"Phase 2 average latency: {sum(phase2_latencies) / len(phase2_latencies):.4f}s per request")
+        
+        # Combine results
+        latencies = phase1_latencies + phase2_latencies
+        outputs = phase1_outputs + phase2_outputs
         all_latencies.extend(latencies)
         all_outputs.extend(outputs)
         
@@ -255,8 +399,8 @@ def run_benchmark(
         
         # Calculate run statistics
         avg_latency = sum(latencies) / len(latencies)
-        total_time = sum(latencies)
-        throughput = len(prompts) / total_time if total_time > 0 else 0
+        total_time = phase1_total_time + phase2_total_time  # Use concurrent total time, not sum of latencies
+        throughput = len(latencies) / total_time if total_time > 0 else 0
         
         # Calculate import statistics
         import_hits = stats_after['import_hits'] - stats_before['import_hits']
