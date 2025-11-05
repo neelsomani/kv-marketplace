@@ -27,46 +27,43 @@ def test_peer_copy_checksum():
         pytest.skip("Need at least 2 GPUs")
     
     import hashlib
+    size = 1024 * 1024  # 1MB
     
+    # Allocate first, before any import that might enable peer access
+    src = torch.randn(size, device='cuda:0', dtype=torch.float16)
+    dst = torch.zeros(size, device='cuda:1', dtype=torch.float16)
+    
+    # Now import
     try:
         from kv_marketplace.transport import p2p_cuda
+        from kv_marketplace.transport import _get_stream_ptr
     except ImportError:
         pytest.skip("CUDA extension not built")
     
-    # Create dummy buffers on GPU 0
-    size = 1024 * 1024  # 1MB
-    src = torch.randn(size, device='cuda:0', dtype=torch.float16)
-    
-    # Compute source checksum
-    src_cpu = src.cpu().numpy()
-    src_hash = hashlib.md5(src_cpu.tobytes()).hexdigest()
-    
-    # Create destination buffer on GPU 1
-    dst = torch.zeros(size, device='cuda:1', dtype=torch.float16)
-    
-    # Ensure peer access
+    # If peer access was already on, ensure() should treat it as success
     if not p2p_cuda.ensure_peer_access(0, 1):
         pytest.skip("Peer access not available between GPU 0 and 1")
     
-    # Copy via P2P
-    from kv_marketplace.transport import _get_stream_ptr
+    # Checksum on src
+    src_hash = hashlib.md5(src.cpu().numpy().tobytes()).hexdigest()
     
-    stream = torch.cuda.Stream(device=1)
-    stream_ptr = _get_stream_ptr(stream)
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
     
-    with torch.cuda.stream(stream):
-        p2p_cuda.memcpy_peer_async(
-            dst.data_ptr(), 1,
-            src.data_ptr(), 0,
-            size * 2,  # bytes (float16 = 2 bytes)
-            stream_ptr
-        )
+    with torch.cuda.device(1):
+        stream = torch.cuda.Stream(device=1)
+        with torch.cuda.stream(stream):
+            p2p_cuda.memcpy_peer_async(
+                dst.data_ptr(), 1,
+                src.data_ptr(), 0,
+                size * 2,  # bytes (float16 = 2 bytes)
+                _get_stream_ptr(stream),
+            )
+        stream.synchronize()
     
-    stream.synchronize()
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
     
-    # Verify checksum
-    dst_cpu = dst.cpu().numpy()
-    dst_hash = hashlib.md5(dst_cpu.tobytes()).hexdigest()
-    
-    assert src_hash == dst_hash, "Checksums don't match after peer copy"
+    dst_hash = hashlib.md5(dst.cpu().numpy().tobytes()).hexdigest()
+    assert src_hash == dst_hash
 

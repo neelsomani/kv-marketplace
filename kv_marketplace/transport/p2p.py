@@ -1,7 +1,7 @@
 """Python wrapper over CUDA P2P extension for peer-to-peer memory copy."""
 
 import torch
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from . import p2p_cuda
 
 
@@ -51,10 +51,25 @@ class PeerCopy:
         return p2p_cuda.ensure_peer_access(src_dev, dst_dev)
     
     @staticmethod
+    def disable_peer_access(src_dev: int, dst_dev: int) -> bool:
+        """Disable peer access between two devices.
+        
+        Args:
+            src_dev: Source GPU device ID
+            dst_dev: Destination GPU device ID
+            
+        Returns:
+            True if peer access was disabled or already disabled, False on error
+        """
+        if src_dev == dst_dev:
+            return True  # Same device, no peer access to disable
+        return p2p_cuda.disable_peer_access(src_dev, dst_dev)
+    
+    @staticmethod
     def copy_kv(dst_dev: int, dst_k_ptrs: List[int], dst_v_ptrs: List[int],
                 src_dev: int, src_k_ptrs: List[int], src_v_ptrs: List[int],
                 n_layers: int, length: int, meta: Dict[str, Any],
-                stream: Optional[torch.cuda.Stream] = None):
+                stream: Optional[Union[torch.cuda.Stream, int]] = None):
         """Copy KV tensors from source to destination GPU.
         
         Args:
@@ -67,13 +82,21 @@ class PeerCopy:
             n_layers: Number of layers
             length: Number of tokens to copy
             meta: Layout metadata
-            stream: CUDA stream for async operations (optional)
+            stream: CUDA stream for async operations. Can be:
+                   - torch.cuda.Stream object
+                   - int (raw CUDA stream pointer)
+                   - None (uses current stream)
         """
+        # Get CUDA stream pointer
         if stream is None:
             stream = torch.cuda.current_stream()
-        
-        # Get CUDA stream pointer
-        stream_ptr = _get_stream_ptr(stream)
+            stream_ptr = _get_stream_ptr(stream)
+        elif isinstance(stream, int):
+            # Already a raw pointer
+            stream_ptr = stream
+        else:
+            # torch.cuda.Stream object
+            stream_ptr = _get_stream_ptr(stream)
         
         for layer_idx in range(n_layers):
             # Calculate size per layer based on meta
