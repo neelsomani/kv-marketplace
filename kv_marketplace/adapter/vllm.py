@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 from typing import Callable, Optional, Tuple, List, TypedDict
+import torch
 from .types import KVLayout, AllocatedKV
 from ..compat import KVCompat
 from ..registry import KVRegistry, KVHandle
@@ -46,6 +47,77 @@ _cross_hits = 0  # Cross-GPU cache hits (marketplace imports)
 # File-based stats sharing for multiprocessing
 _stats_file = None
 _stats_lock_file = None
+
+
+def get_stable_device_id(local_device_id: int) -> Optional[str]:
+    """Get a stable, globally unique device identifier.
+    
+    Uses PCI bus ID (preferred) or UUID as fallback. This ensures correct
+    device identification even when CUDA_VISIBLE_DEVICES makes each process
+    see its GPU as device 0.
+    
+    Args:
+        local_device_id: Local device ordinal (e.g., from torch.cuda.current_device())
+        
+    Returns:
+        Stable device identifier string (PCI bus ID or UUID), or None if unavailable.
+        Returns None (not device name) to avoid collisions when multiple GPUs share the same name.
+    """
+    try:
+        props = torch.cuda.get_device_properties(local_device_id)
+        # Prefer PCI bus ID (most stable)
+        if getattr(props, 'pci_bus_id', None):
+            return props.pci_bus_id
+        # PyTorch >=2.1 exposes props.uuid (bytes-like or str depending on build)
+        uuid_attr = getattr(props, 'uuid', None)
+        if uuid_attr:
+            return str(uuid_attr)
+        # Fallback via our CUDA ext (NVML/CUDA runtime)
+        if hasattr(p2p_cuda, 'get_device_uuid'):
+            uuid = p2p_cuda.get_device_uuid(local_device_id)
+            if uuid:
+                return uuid
+    except Exception as e:
+        logger.warning(f"Could not get stable device ID for device {local_device_id}: {e}")
+    
+    # No stable id → return None (force "not same GPU" classification)
+    return None
+
+
+def resolve_stable_id_to_local_ordinal(stable_device_id: str) -> Optional[int]:
+    """Map a stable device identifier back to local device ordinal.
+    
+    Args:
+        stable_device_id: Stable device identifier (PCI bus ID or UUID)
+        
+    Returns:
+        Local device ordinal if found, None otherwise.
+        Note: Returns None if the device is not visible in this process
+        (e.g., when CUDA_VISIBLE_DEVICES hides it).
+    """
+    try:
+        num_devices = torch.cuda.device_count()
+        for local_idx in range(num_devices):
+            props = torch.cuda.get_device_properties(local_idx)
+            
+            # Check PCI bus ID first
+            if getattr(props, 'pci_bus_id', None) == stable_device_id:
+                return local_idx
+            
+            # Check UUID via PyTorch props
+            uuid_attr = getattr(props, 'uuid', None)
+            if uuid_attr and str(uuid_attr) == stable_device_id:
+                return local_idx
+            
+            # Check UUID via our CUDA extension
+            if hasattr(p2p_cuda, 'get_device_uuid'):
+                uuid = p2p_cuda.get_device_uuid(local_idx)
+                if uuid == stable_device_id:
+                    return local_idx
+    except Exception as e:
+        logger.warning(f"Could not resolve stable device ID {stable_device_id} to local ordinal: {e}")
+    
+    return None
 
 
 def _get_stats_file_path():
@@ -301,6 +373,8 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
     Returns:
         Tuple of (lcp_len, dst_alloc) if import succeeds, None otherwise
     """
+    global _import_misses, _import_hits, _local_hits, _cross_hits
+    
     try:
         # Get compatibility from context
         compat = ctx['compat']
@@ -328,7 +402,6 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         lcp_result = _prefix_index.find_lcp(tokens)
         if lcp_result is None:
             logger.debug(f"kv-marketplace before_prefill: No LCP found for tokens (length={len(tokens)}, prefix_index_size={prefix_index_size})")
-            global _import_misses
             _import_misses += 1
             _write_stats_to_file()
             return None
@@ -352,41 +425,55 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             _write_stats_to_file()
             return None
         
-        logger.info(f"kv-marketplace: Registry lookup succeeded! handle.device_id={handle.device_id}, handle.device_uuid={getattr(handle, 'device_uuid', None)}, current_device_id={device_id}, lcp_len={lcp_len}")
+        # Get stable device IDs for comparison
+        handle_global_id = getattr(handle, 'device_global_id', None) or getattr(handle, 'device_uuid', None)
+        current_global_id = get_stable_device_id(device_id)
         
-        # Get current device UUID for comparison
-        current_device_uuid = p2p_cuda.get_device_uuid(device_id) if hasattr(p2p_cuda, 'get_device_uuid') else None
+        logger.info(f"kv-marketplace: Registry lookup succeeded! handle.device_id={handle.device_id}, handle.device_global_id={handle_global_id}, current_device_id={device_id}, current_global_id={current_global_id}, lcp_len={lcp_len}")
         
-        # Check if cache hit is on the same GPU using UUID (globally unique)
-        # If UUID is not available, fall back to device_id comparison (legacy mode)
-        is_same_gpu = False
-        if hasattr(handle, 'device_uuid') and handle.device_uuid and current_device_uuid:
-            # Use UUID comparison (reliable across processes)
-            is_same_gpu = (handle.device_uuid == current_device_uuid)
-        else:
-            # Fallback to device_id comparison (legacy mode, may fail across processes)
-            is_same_gpu = (handle.device_id == device_id)
+        # Check if cache hit is on the same GPU using stable global ID
+        # This is reliable across processes even when CUDA_VISIBLE_DEVICES makes both see device 0
+        # Only compare when both IDs are available (not None)
+        is_same_gpu = (handle_global_id is not None and
+                      current_global_id is not None and
+                      handle_global_id == current_global_id)
         
         if is_same_gpu:
             # Same GPU - let vLLM's native cache management handle local reuse
             # This avoids unnecessary memory allocation and copying overhead
-            logger.info(f"kv-marketplace: Cache hit on same GPU {device_id} (lcp_len={lcp_len}), skipping marketplace import (let vLLM handle local reuse)")
-            global _local_hits
+            logger.info(f"kv-marketplace: Cache hit on same GPU {device_id} (global_id={current_global_id}, lcp_len={lcp_len}), skipping marketplace import (let vLLM handle local reuse)")
             _local_hits += 1
             _write_stats_to_file()
             return None
         
-        # Cross-GPU cache hit - map source UUID to local ordinal for P2P operations
-        src_dev_local = device_id  # Default to current device_id (will be wrong if UUID mapping fails)
-        if hasattr(handle, 'device_uuid') and handle.device_uuid:
-            # Map source UUID to local ordinal
-            src_dev_local = p2p_cuda.uuid_to_local_ordinal(handle.device_uuid)
-            if src_dev_local < 0:
-                logger.warning(f"Could not map source UUID {handle.device_uuid} to local ordinal, using handle.device_id={handle.device_id}")
-                src_dev_local = handle.device_id  # Fallback to stored device_id
+        # Cross-GPU cache hit - map source stable ID to local ordinal for P2P operations
+        src_dev_local = None
+        if handle_global_id:
+            # Map source stable ID to local ordinal
+            src_dev_local = resolve_stable_id_to_local_ordinal(handle_global_id)
+            if src_dev_local is None:
+                logger.warning(f"Could not map source global ID {handle_global_id} to local ordinal, trying UUID fallback")
+                # Try UUID-based mapping as fallback
+                if hasattr(p2p_cuda, 'uuid_to_local_ordinal') and handle_global_id:
+                    src_dev_local = p2p_cuda.uuid_to_local_ordinal(handle_global_id)
+                    if src_dev_local < 0:
+                        src_dev_local = None
+        
+        if src_dev_local is None:
+            # Source device is not visible in this process (e.g., CUDA_VISIBLE_DEVICES hides it).
+            # Peer-to-peer copy requires both devices to be visible in the same process.
+            logger.warning(
+                f"Could not resolve source device {handle_global_id} to local ordinal. "
+                f"This usually means the source GPU is not visible in this process "
+                f"(e.g., CUDA_VISIBLE_DEVICES is set). Peer-to-peer copy requires both "
+                f"GPUs to be visible. Cannot proceed with cross-GPU import."
+            )
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
         
         # Cross-GPU cache hit - proceed with marketplace import
-        logger.info(f"kv-marketplace: Cross-GPU cache hit found! src_dev={src_dev_local} (UUID={getattr(handle, 'device_uuid', None)}), dst_dev={device_id}, lcp_len={lcp_len}, proceeding with import")
+        logger.info(f"kv-marketplace: Cross-GPU cache hit found! src_dev={src_dev_local} (global_id={handle_global_id}), dst_dev={device_id} (global_id={current_global_id}), lcp_len={lcp_len}, proceeding with import")
         
         # Allocate destination KV cache
         dst_alloc = ctx['alloc_prefix'](lcp_len)
@@ -517,14 +604,17 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         # Compute prefix hash and insert into prefix index
         prefix_hash = _prefix_index.insert(prefix_tokens)
         
-        # Get globally unique device UUID (for cross-process device identity)
+        # Get stable globally unique device identifier (PCI bus ID or UUID)
         # This ensures correct device identification even when CUDA_VISIBLE_DEVICES
         # makes each process see its GPU as device 0
-        device_uuid = p2p_cuda.get_device_uuid(device_id)
-        if not device_uuid:
-            # Fallback: use device_id as string (legacy mode)
-            logger.warning(f"Could not get UUID for device {device_id}, using device_id as fallback")
-            device_uuid = None
+        device_global_id = get_stable_device_id(device_id)
+        
+        # Also get UUID for backward compatibility
+        device_uuid = None
+        if hasattr(p2p_cuda, 'get_device_uuid'):
+            device_uuid = p2p_cuda.get_device_uuid(device_id)
+        
+        logger.debug(f"Exporting KV cache: device_id={device_id}, device_global_id={device_global_id}, device_uuid={device_uuid}")
         
         # Build KVHandle from context
         handle = KVHandle(
@@ -539,7 +629,8 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
                 'page_size': layout['page_size'],
                 **layout.get('strides', {})
             },
-            device_uuid=device_uuid  # Globally unique UUID
+            device_uuid=device_uuid,  # UUID (for backward compatibility)
+            device_global_id=device_global_id  # Stable global ID (PCI bus ID or UUID, preferred)
         )
         
         # Register in registry

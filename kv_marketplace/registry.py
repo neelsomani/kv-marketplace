@@ -9,7 +9,8 @@ class KVHandle:
     """Handle to exported KV cache with metadata for transfer."""
     
     def __init__(self, device_id: int, k_ptrs: list, v_ptrs: list, 
-                 length: int, layout_meta: dict, device_uuid: Optional[str] = None):
+                 length: int, layout_meta: dict, device_uuid: Optional[str] = None,
+                 device_global_id: Optional[str] = None):
         """Initialize a KV handle.
         
         Args:
@@ -18,10 +19,12 @@ class KVHandle:
             v_ptrs: Per-layer device pointers/addresses for V tensors
             length: Number of tokens materialized
             layout_meta: Layout metadata (strides, page_size, etc.)
-            device_uuid: Globally unique device UUID (CUDA UUID). If None, device_id will be used (legacy mode).
+            device_uuid: Globally unique device UUID (CUDA UUID). Deprecated, use device_global_id instead.
+            device_global_id: Stable globally unique device identifier (PCI bus ID or UUID). Preferred over device_uuid.
         """
         self.device_id = device_id  # Local ordinal (for backward compatibility)
-        self.device_uuid = device_uuid  # Globally unique UUID (preferred)
+        self.device_uuid = device_uuid  # Globally unique UUID (deprecated, kept for backward compatibility)
+        self.device_global_id = device_global_id or device_uuid  # Stable global ID (PCI bus ID or UUID, preferred)
         self.k_ptrs = k_ptrs
         self.v_ptrs = v_ptrs
         self.length = length

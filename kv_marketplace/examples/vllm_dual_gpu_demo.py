@@ -169,6 +169,12 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
     # Set device mask BEFORE any CUDA/PyTorch initialization
     os.environ['CUDA_VISIBLE_DEVICES'] = device_mask
     
+    # If we exposed both GPUs, choose the second one explicitly before any torch/vllm use
+    # This allows Phase 2 to see both GPUs (for cross-GPU imports) while using GPU 1
+    if device_mask == "0,1":
+        import torch
+        torch.cuda.set_device(1)  # pin current context to the second visible device
+    
     # Force vLLM's internal workers to use spawn instead of fork
     # This must be set before any torch/vllm imports
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -581,8 +587,9 @@ def run_benchmark(
         time.sleep(0.5)
         
         # Phase 2: Process on GPU 1 (forces cross-GPU)
+        # Make both GPUs visible so Phase 2 can import from GPU 0
         print(f"\n--- Phase 2: Test ({len(phase2_prompts)} requests on GPU 1, scrambled prefixes) ---")
-        p2 = Process(target=child_run, args=("1", model, shared_kwargs, phase2_prompts, 
+        p2 = Process(target=child_run, args=("0,1", model, shared_kwargs, phase2_prompts, 
                                              sampling_params_dict, q2, "Phase2"))
         p2.start()
         
