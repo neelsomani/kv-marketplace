@@ -11,9 +11,9 @@ import torch
 from .types import KVLayout, AllocatedKV
 from ..compat import KVCompat
 from ..registry import KVRegistry, KVHandle
-from ..registry_backend import FileBasedRegistryBackend
+from ..registry_backend import FileBasedRegistryBackend, SharedMemoryRegistryBackend
 from ..prefix_index import PrefixIndex, TrieNode
-from ..prefix_index_backend import FileBasedPrefixIndex
+from ..prefix_index_backend import FileBasedPrefixIndex, SharedMemoryPrefixIndex
 from ..transport.p2p import PeerCopy
 from ..transport import p2p_cuda
 
@@ -33,16 +33,53 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 _USE_FILE_BACKEND = _env_flag('KV_MARKETPLACE_FILE_BACKEND')
+_USE_SHM_BACKEND = _env_flag('KV_MARKETPLACE_SHM_BACKEND', True)
+_USE_INPROC_BACKEND = _env_flag('KV_MARKETPLACE_IN_PROCESS_BACKEND')
+
+
+def _env_int(name: str, default: int) -> int:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+_SHM_NAMESPACE = os.environ.get('KV_MARKETPLACE_SHM_NAMESPACE', 'kv_marketplace')
+_SHM_REGISTRY_MB = max(1, _env_int('KV_MARKETPLACE_SHM_REGISTRY_MB', 8))
+_SHM_PREFIX_MB = max(1, _env_int('KV_MARKETPLACE_SHM_PREFIX_MB', 32))
 
 # Global instances for registry and prefix index
 # Use file-based backend if enabled for multi-process sharing on same machine
-if _USE_FILE_BACKEND:
+if _USE_INPROC_BACKEND:
+    _registry = KVRegistry()
+    _prefix_index = PrefixIndex()
+    logger.info("kv-marketplace: Forcing in-process registry and prefix index backends")
+elif _USE_FILE_BACKEND:
     logger.info("kv-marketplace: Using file-based registry and prefix index backends for multi-process sharing")
     _registry = KVRegistry(backend=FileBasedRegistryBackend())
     _prefix_index = FileBasedPrefixIndex()  # File-based prefix index for cross-process persistence
+elif _USE_SHM_BACKEND:
+    registry_backend = SharedMemoryRegistryBackend(
+        shm_name=f"{_SHM_NAMESPACE}_registry",
+        size_bytes=_SHM_REGISTRY_MB * 1024 * 1024,
+    )
+    _registry = KVRegistry(backend=registry_backend)
+    _prefix_index = SharedMemoryPrefixIndex(
+        shm_name=f"{_SHM_NAMESPACE}_prefix",
+        size_bytes=_SHM_PREFIX_MB * 1024 * 1024,
+    )
+    logger.info(
+        "kv-marketplace: Using shared-memory registry (%s) and prefix index (%s) backends",
+        getattr(registry_backend, 'storage_backend', 'unknown'),
+        getattr(_prefix_index, 'storage_backend', 'unknown'),
+    )
 else:
-    _registry = KVRegistry()  # Default: in-process backend
-    _prefix_index = PrefixIndex()  # Default: in-process prefix index
+    logger.info("kv-marketplace: Shared-memory backend disabled; using in-process registry/prefix index")
+    _registry = KVRegistry()
+    _prefix_index = PrefixIndex()
 
 # Default minimum prefix length (can be overridden by vLLM flags)
 _MIN_PREFIX_LENGTH = 64

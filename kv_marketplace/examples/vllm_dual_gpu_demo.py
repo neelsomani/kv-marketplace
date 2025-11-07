@@ -197,15 +197,32 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
     
     # Only enable file backend if kv-marketplace is enabled
     if kvm_enabled:
-        os.environ.setdefault('KV_MARKETPLACE_FILE_BACKEND', '1')
+        os.environ.setdefault('KV_MARKETPLACE_SHM_BACKEND', '1')
     else:
         os.environ.pop('KV_MARKETPLACE_FILE_BACKEND', None)
+        os.environ.pop('KV_MARKETPLACE_SHM_BACKEND', None)
     
     llm = None
     get_stats = None
     
     try:
         # Import vllm - this will use the editable install from vllm/ folder (which is correct)
+        import torch
+
+        # NVML cannot initialize in some containerized environments, which makes
+        # vLLM fall back to UnspecifiedPlatform (device string == ""). Manually fix
+        # the platform before EngineArgs inspects it so DeviceConfig always sees
+        # a concrete device type.
+        try:
+            import vllm.platforms as vllm_platforms
+            from vllm.platforms.cuda import CudaPlatform
+            from vllm.platforms.cpu import CpuPlatform
+            vllm_platforms.current_platform = (
+                CudaPlatform() if torch.cuda.is_available() else CpuPlatform()
+            )
+        except Exception:
+            pass
+
         import vllm
         from vllm.entrypoints.llm import LLM
         from vllm.sampling_params import SamplingParams
@@ -272,7 +289,6 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
         print(f"[{phase_name}] cfg.enable_prefix_caching: {llm.llm_engine.cache_config.enable_prefix_caching}")
     
         # Sanity logs: print device IDs to verify correct GPU selection
-        import torch
         if torch.cuda.is_available():
             local_device_id = torch.cuda.current_device()
             print(f"  [{phase_name}] Local device ordinal: {local_device_id}")
@@ -534,6 +550,8 @@ def run_benchmark(
         # (set in child_run before any torch/vllm imports)
         **llm_kwargs
     }
+    # Guard against accidental 'device' kwargs sneaking in through llm_kwargs/etc.
+    shared_kwargs.pop('device', None)
     
     # Convert SamplingParams to dict for multiprocessing (avoids serialization issues with vLLM)
     # This prevents msgspec validation errors when the object is pickled/unpickled across processes

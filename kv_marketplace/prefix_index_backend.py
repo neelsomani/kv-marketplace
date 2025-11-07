@@ -4,8 +4,9 @@ import os
 import json
 import tempfile
 import fcntl
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 from .prefix_index import PrefixIndex
+from .shared_memory_store import SharedMemoryJSONStore
 
 
 class FileBasedPrefixIndex(PrefixIndex):
@@ -105,3 +106,61 @@ class FileBasedPrefixIndex(PrefixIndex):
         
         return result_hash
 
+
+class SharedMemoryPrefixIndex(PrefixIndex):
+    """PrefixIndex that stores token sequences inside shared memory."""
+
+    def __init__(
+        self,
+        shm_name: Optional[str] = None,
+        size_bytes: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        name = shm_name or 'kv_marketplace_prefix_index'
+        size = size_bytes or (32 * 1024 * 1024)
+        self._store = SharedMemoryJSONStore(
+            name=name,
+            size_bytes=size,
+            default_factory=lambda: {'sequences': []},
+        )
+        self._sequence_cache: Set[Tuple[int, ...]] = set()
+        self._load_sequences()
+
+    @property
+    def storage_backend(self) -> str:
+        return getattr(self._store, 'backend', 'unknown')
+
+    def _load_sequences(self) -> None:
+        data = self._store.load(shared=True)
+        sequences = data.get('sequences', []) if isinstance(data, dict) else []
+        for tokens in sequences:
+            if not isinstance(tokens, list):
+                continue
+            seq_tuple = tuple(tokens)
+            if seq_tuple in self._sequence_cache:
+                continue
+            self._sequence_cache.add(seq_tuple)
+            super().insert(list(tokens))
+
+    def insert(self, tokens: List[int], prefix_hash: Optional[bytes] = None) -> bytes:
+        result_hash = super().insert(tokens, prefix_hash)
+        tokens_copy = list(tokens)
+        seq_tuple = tuple(tokens_copy)
+        if seq_tuple in self._sequence_cache:
+            return result_hash
+
+        inserted = {'added': False}
+
+        def _mutator(payload):
+            if not isinstance(payload, dict):
+                payload = {'sequences': []}
+            sequences = payload.setdefault('sequences', [])
+            if tokens_copy not in sequences:
+                sequences.append(tokens_copy)
+                inserted['added'] = True
+            return payload
+
+        self._store.update(_mutator)
+        if inserted['added']:
+            self._sequence_cache.add(seq_tuple)
+        return result_hash

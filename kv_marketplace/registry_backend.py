@@ -16,6 +16,8 @@ from typing import Optional, Dict, Tuple, List, TYPE_CHECKING
 # Import at runtime to avoid circular dependency
 # These will be imported when needed in methods
 
+from .shared_memory_store import SharedMemoryJSONStore
+
 
 class RegistryBackend(ABC):
     """Abstract base class for registry storage backends."""
@@ -254,3 +256,96 @@ class FileBasedRegistryBackend(RegistryBackend):
             return keys
         finally:
             self._release_lock(lock_fd)
+
+
+class SharedMemoryRegistryBackend(RegistryBackend):
+    """Shared-memory registry backend using an in-memory JSON store."""
+
+    def __init__(
+        self,
+        shm_name: Optional[str] = None,
+        size_bytes: Optional[int] = None,
+    ) -> None:
+        name = shm_name or 'kv_marketplace_registry'
+        size = size_bytes or (8 * 1024 * 1024)
+        self._store = SharedMemoryJSONStore(
+            name=name,
+            size_bytes=size,
+            default_factory=dict,
+        )
+
+    def _make_key(self, compat: 'KVCompat', prefix_hash: bytes) -> str:
+        return f"{compat.checksum.hex()}:{prefix_hash.hex()}"
+
+    @property
+    def storage_backend(self) -> str:
+        return getattr(self._store, 'backend', 'unknown')
+
+    def _serialize_handle(self, handle: 'KVHandle') -> Dict:
+        data = {
+            'device_id': handle.device_id,
+            'k_ptrs': handle.k_ptrs,
+            'v_ptrs': handle.v_ptrs,
+            'length': handle.length,
+            'layout_meta': handle.layout_meta,
+        }
+        if getattr(handle, 'device_uuid', None):
+            data['device_uuid'] = handle.device_uuid
+        if getattr(handle, 'device_global_id', None):
+            data['device_global_id'] = handle.device_global_id
+        return data
+
+    def _deserialize_handle(self, data: Dict) -> 'KVHandle':
+        from .registry import KVHandle
+
+        return KVHandle(
+            device_id=data['device_id'],
+            k_ptrs=data['k_ptrs'],
+            v_ptrs=data['v_ptrs'],
+            length=data['length'],
+            layout_meta=data['layout_meta'],
+            device_uuid=data.get('device_uuid'),
+            device_global_id=data.get('device_global_id'),
+        )
+
+    def register(self, compat: 'KVCompat', prefix_hash: bytes, handle: 'KVHandle') -> None:
+        serialized = self._serialize_handle(handle)
+        key = self._make_key(compat, prefix_hash)
+
+        def _mutator(registry: Dict[str, Dict]):
+            registry[key] = serialized
+
+        self._store.update(_mutator)
+
+    def lookup(self, compat: 'KVCompat', prefix_hash: bytes) -> Optional['KVHandle']:
+        key = self._make_key(compat, prefix_hash)
+        registry = self._store.load(shared=True)
+        entry = registry.get(key)
+        if entry is None:
+            return None
+        return self._deserialize_handle(entry)
+
+    def remove(self, compat: 'KVCompat', prefix_hash: bytes) -> None:
+        key = self._make_key(compat, prefix_hash)
+
+        def _mutator(registry: Dict[str, Dict]):
+            registry.pop(key, None)
+
+        self._store.update(_mutator)
+
+    def size(self) -> int:
+        registry = self._store.load(shared=True)
+        return len(registry)
+
+    def list_keys(self) -> List[Tuple[bytes, bytes]]:
+        registry = self._store.load(shared=True)
+        keys: List[Tuple[bytes, bytes]] = []
+        for key_str in registry.keys():
+            parts = key_str.split(':')
+            if len(parts) != 2:
+                continue
+            try:
+                keys.append((bytes.fromhex(parts[0]), bytes.fromhex(parts[1])))
+            except ValueError:
+                continue
+        return keys
