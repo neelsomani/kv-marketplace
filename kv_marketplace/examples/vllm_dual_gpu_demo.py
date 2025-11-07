@@ -473,8 +473,13 @@ def print_stats_table(results: List[Dict], title: str):
     # Calculate averages
     avg_latency = sum(r['avg_latency'] for r in results) / len(results)
     avg_throughput = sum(r.get('throughput', 0) for r in results) / len(results) if any('throughput' in r for r in results) else 0
-    
+    avg_latency_ex_first = (
+        sum(r.get('avg_latency_ex_first', r['avg_latency']) for r in results) / len(results)
+    )
+
     print(f"\nAverage Latency: {avg_latency:.4f}s")
+    if avg_latency_ex_first and avg_latency_ex_first != avg_latency:
+        print(f"Average Latency (excl. first request): {avg_latency_ex_first:.4f}s")
     if avg_throughput > 0:
         print(f"Average Throughput: {avg_throughput:.2f} req/s")
     
@@ -773,6 +778,18 @@ def run_benchmark(
         avg_latency = sum(latencies) / len(latencies)
         total_time = phase1_total_time + phase2_total_time  # Sum of wall-clock times
         throughput = len(latencies) / total_time if total_time > 0 else 0
+        trimmed_latencies = latencies[1:]
+        trimmed_total_time = max(total_time - (latencies[0] if latencies else 0.0), 0.0)
+        trimmed_avg_latency = (
+            sum(trimmed_latencies) / len(trimmed_latencies)
+            if trimmed_latencies
+            else avg_latency
+        )
+        trimmed_throughput = (
+            len(trimmed_latencies) / trimmed_total_time
+            if trimmed_latencies and trimmed_total_time > 0
+            else 0.0
+        )
         
         # Combine stats from both phases
         import_hits = phase1_stats['import_hits'] + phase2_stats['import_hits']
@@ -837,12 +854,22 @@ def run_benchmark(
             'phase2_cross_hits': phase2_stats.get('cross_hits', 0),
             'phase2_import_hits': phase2_stats.get('import_hits', 0),
             'phase2_import_misses': phase2_stats.get('import_misses', 0),
+            'avg_latency_ex_first': trimmed_avg_latency,
+            'total_latency_ex_first': trimmed_total_time if trimmed_latencies else total_time,
+            'throughput_ex_first': trimmed_throughput if trimmed_latencies else throughput,
+            'num_requests': len(latencies),
+            'num_requests_ex_first': len(trimmed_latencies),
         }
         run_stats.append(run_stat)
         
         print(f"  Average latency: {avg_latency:.4f}s")
         print(f"  Total time: {total_time:.4f}s")
         print(f"  Throughput: {throughput:.2f} req/s")
+        if trimmed_latencies:
+            print(
+                f"    (excluding first request) avg latency: {trimmed_avg_latency:.4f}s, "
+                f"throughput: {trimmed_throughput:.2f} req/s"
+            )
         if kv_marketplace:
             print(f"  Registry size: {total_registry_size}")
             print(f"  Prefix index size: {total_prefix_index_size}")
@@ -860,6 +887,21 @@ def run_benchmark(
     # Sum up the batched wall-clock times from each run
     overall_total_time = sum(run_stat['total_latency'] for run_stat in run_stats)
     overall_throughput = len(phase1_prompts + phase2_prompts) * num_runs / overall_total_time if overall_total_time > 0 else 0
+    trimmed_all_latencies = all_latencies[1:]
+    trimmed_request_count = sum(r.get('num_requests_ex_first', 0) for r in run_stats)
+    overall_avg_latency_ex_first = (
+        sum(trimmed_all_latencies) / len(trimmed_all_latencies)
+        if trimmed_all_latencies
+        else overall_avg_latency
+    )
+    overall_total_time_ex_first = sum(
+        r.get('total_latency_ex_first', r['total_latency']) for r in run_stats
+    )
+    overall_throughput_ex_first = (
+        trimmed_request_count / overall_total_time_ex_first
+        if trimmed_request_count > 0 and overall_total_time_ex_first > 0
+        else 0.0
+    )
     
     final_stats = get_registry_stats(get_stats_fn)
     
@@ -876,8 +918,11 @@ def run_benchmark(
         'num_runs': num_runs,
         'num_prompts': len(phase1_prompts) + len(phase2_prompts),
         'avg_latency': overall_avg_latency,
+        'avg_latency_ex_first': overall_avg_latency_ex_first,
         'total_latency': overall_total_time,
+        'total_latency_ex_first': overall_total_time_ex_first,
         'throughput': overall_throughput,
+        'throughput_ex_first': overall_throughput_ex_first,
         'registry_size': final_stats['registry_size'],
         'prefix_index_size': final_stats['prefix_index_size'],
         'import_hits': total_import_hits,
@@ -890,6 +935,15 @@ def run_benchmark(
         'all_latencies': all_latencies,
         'all_outputs': all_outputs,
     }
+
+    if trimmed_all_latencies:
+        print(
+            f"\nOverall avg latency (excluding first request): {overall_avg_latency_ex_first:.4f}s"
+        )
+        if overall_throughput_ex_first > 0:
+            print(
+                f"Overall throughput (excluding first request): {overall_throughput_ex_first:.2f} req/s"
+            )
 
     if kv_marketplace and shutdown_backends_fn:
         try:
