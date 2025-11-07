@@ -19,7 +19,7 @@ import time
 import argparse
 import logging
 import random
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 from collections import defaultdict
 from multiprocessing import Process, Queue
 
@@ -155,7 +155,10 @@ def measure_latency(llm, prompts: List[str], sampling_params: Any) -> Tuple[List
 
 
 def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[str], 
-              sampling_params_dict: Dict, result_queue: Queue, phase_name: str):
+              sampling_params_dict: Dict, result_queue: Queue, phase_name: str,
+              prefetch_only: bool = False, rehome_after_import: bool = False,
+              prefetch_prompts: Optional[List[str]] = None,
+              prefetch_sampling_params_dict: Optional[Dict] = None):
     """Child process function that runs one phase of the benchmark.
     
     Sets CUDA_VISIBLE_DEVICES, initializes LLM, runs batched generation,
@@ -198,9 +201,14 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
     # Only enable file backend if kv-marketplace is enabled
     if kvm_enabled:
         os.environ.setdefault('KV_MARKETPLACE_SHM_BACKEND', '1')
+        if rehome_after_import:
+            os.environ['KV_MARKETPLACE_REHOME_AFTER_IMPORT'] = '1'
+        else:
+            os.environ.pop('KV_MARKETPLACE_REHOME_AFTER_IMPORT', None)
     else:
         os.environ.pop('KV_MARKETPLACE_FILE_BACKEND', None)
         os.environ.pop('KV_MARKETPLACE_SHM_BACKEND', None)
+        os.environ.pop('KV_MARKETPLACE_REHOME_AFTER_IMPORT', None)
     
     llm = None
     get_stats = None
@@ -231,9 +239,11 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
         # This ensures the object is created fresh in this process context
         sampling_params = SamplingParams(**sampling_params_dict)
 
+        reset_stats_fn = None
         if kvm_enabled:
             # Only import kv_marketplace adapter if it's enabled
-            from kv_marketplace.adapter.vllm import get_stats
+            from kv_marketplace.adapter.vllm import get_stats, reset_stats as adapter_reset_stats
+            reset_stats_fn = adapter_reset_stats
         else:
             # Skip adapter import entirely if kv-marketplace is disabled
             get_stats = None
@@ -304,7 +314,43 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
                 except Exception:
                     pass  # Skip if adapter not available
         
-        # Run batched generation
+        prefetch_info = None
+        if prefetch_prompts and prefetch_sampling_params_dict:
+            pref_sampling_params = SamplingParams(**prefetch_sampling_params_dict)
+            pref_lats, pref_outs, _, pref_wall = measure_latency_concurrent_local(
+                llm, prefetch_prompts, pref_sampling_params, f"{phase_name}-prefetch"
+            )
+            pref_stats = zero_stats()
+            if kvm_enabled and get_stats is not None:
+                try:
+                    pref_stats = get_stats()
+                except Exception:
+                    pref_stats = zero_stats()
+            prefetch_info = {
+                "latencies": pref_lats,
+                "outputs": pref_outs,
+                "wall": pref_wall,
+                "stats": pref_stats,
+            }
+
+            if prefetch_only:
+                result_queue.put({
+                    "latencies": pref_lats,
+                    "outputs": pref_outs,
+                    "wall": pref_wall,
+                    "stats": norm_stats(pref_stats),
+                    "prefetch_only": True,
+                    "prefetch": prefetch_info,
+                })
+                return
+
+            if kvm_enabled and reset_stats_fn is not None:
+                try:
+                    reset_stats_fn()
+                except Exception:
+                    pass
+
+        # Run batched generation for measured prompts
         lats, outs, _, wall = measure_latency_concurrent_local(llm, prompts, sampling_params, phase_name)
         
         # Get adapter stats - default to zeros, overwrite only if enabled and callable succeeds
@@ -325,12 +371,16 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
                 pass  # keep zeros
         
         # Put results in queue
-        result_queue.put({
+        result = {
             "latencies": lats,
             "outputs": outs,
             "wall": wall,
-            "stats": stats
-        })
+            "stats": stats,
+            "prefetch_only": prefetch_only,
+        }
+        if prefetch_info is not None:
+            result["prefetch"] = prefetch_info
+        result_queue.put(result)
     except Exception as e:
         import traceback
         # Put error in queue with traceback for debugging
@@ -449,6 +499,7 @@ def run_benchmark(
     gpu_memory_utilization: float = 0.9,
     tensor_parallel_size: int = 1,
     max_model_len: int = 1024,
+    prefetch_phase2: bool = True,
     **llm_kwargs
 ) -> Dict:
     """Run benchmark with or without kv-marketplace.
@@ -463,6 +514,7 @@ def run_benchmark(
         gpu_memory_utilization: GPU memory utilization
         tensor_parallel_size: Tensor parallelism (1 = single GPU)
         max_model_len: Maximum model length
+        prefetch_phase2: Prefetch Phase 2 prefixes onto destination GPU before measurement
         **llm_kwargs: Additional LLM arguments
         
     Returns:
@@ -636,24 +688,38 @@ def run_benchmark(
                   f"local_hits={phase1_stats['local_hits']}, "
                   f"cross_hits={phase1_stats['cross_hits']}")
         
-        # Reset stats before Phase 2 so Phase 2 stats only reflect Phase 2 activity
-        # (Registry/exports remain intact for Phase 2 to import from Phase 1)
+        # Reset stats so measured Phase 2 excludes Phase 1 and prefetch activity
         if kv_marketplace and reset_stats_fn:
             try:
                 reset_stats_fn()
-                print("Reset stats before Phase 2 (registry preserved)")
+                print("Reset stats before measured Phase 2 (registry preserved)")
             except Exception as e:
                 print(f"Warning: Failed to reset stats before Phase 2: {e}")
         
         # Barrier
         time.sleep(0.5)
         
+        prefetch_kwargs = {}
+        if kv_marketplace and prefetch_phase2:
+            print(f"\n--- Prefetching Phase 2 prefixes onto GPU 1 (will reuse same worker) ---")
+            prefetch_sampling_params = dict(sampling_params_dict)
+            prefetch_sampling_params['max_tokens'] = max(1, prefetch_sampling_params.get('max_tokens', 1))
+            prefetch_sampling_params['temperature'] = 0.0
+            prefetch_sampling_params['top_p'] = 1.0
+            prefetch_kwargs = {
+                'prefetch_prompts': phase2_prompts,
+                'prefetch_sampling_params_dict': prefetch_sampling_params,
+                'rehome_after_import': True,
+            }
         # Phase 2: Process on GPU 1 (forces cross-GPU)
         # Make both GPUs visible so Phase 2 can import from GPU 0
         print(f"\n--- Phase 2: Test ({len(phase2_prompts)} requests on GPU 1) ---")
         # Make GPU1 the first visible device so vLLM picks it, but keep GPU0 visible for P2P
-        p2 = Process(target=child_run, args=("1,0", model, shared_kwargs, phase2_prompts, 
-                                             sampling_params_dict, q2, "Phase2"))
+        p2 = Process(
+            target=child_run,
+            args=("1,0", model, shared_kwargs, phase2_prompts, sampling_params_dict, q2, "Phase2"),
+            kwargs=prefetch_kwargs,
+        )
         p2.start()
         
         # Wait for child result first; if it wedges, we can terminate it
@@ -674,6 +740,10 @@ def run_benchmark(
         if p2.is_alive():
             p2.terminate()
             p2.join(10)
+        if kv_marketplace and prefetch_phase2:
+            pref_info = r2.get("prefetch")
+            if pref_info:
+                print(f"Prefetch completed in {pref_info.get('wall', 0.0):.4f}s")
         
         if "error" in r2:
             print(f"ERROR in Phase 2: {r2['error']}")
@@ -722,7 +792,10 @@ def run_benchmark(
                   f"total_import_misses={import_misses}, "
                   f"local_hits={local_hits}, "
                   f"cross_hits={cross_hits}")
-            print(f"  Run stats: local_hits={local_hits}, cross_hits={cross_hits} (cross_hits should be > 0 for benefit)")
+            if not prefetch_phase2:
+                print(f"  Run stats: local_hits={local_hits}, cross_hits={cross_hits} (cross_hits should be > 0 for benefit)")
+            else:
+                print(f"  Run stats: local_hits={local_hits}, cross_hits={cross_hits}")
         
         # Calculate total_registry_size and total_prefix_index_size for run_stat
         total_registry_size = max(phase1_stats['registry_size'], phase2_stats['registry_size']) if kv_marketplace else 0
@@ -778,7 +851,7 @@ def run_benchmark(
             print(f"  Import misses: {import_misses}")
             if avg_lcp > 0:
                 print(f"  Average LCP length: {avg_lcp:.1f} tokens")
-            if cross_hits == 0:
+            if cross_hits == 0 and not prefetch_phase2:
                 print(f"  WARNING: No cross-GPU hits! Marketplace benefit requires cross_hits > 0")
     
     # Calculate overall statistics
@@ -1149,6 +1222,8 @@ Examples:
                        help='Run only kv-marketplace version (skip baseline when using --compare)')
     parser.add_argument('--print-registry-keys', action='store_true', default=False,
                        help='Print registry keys at the end (default: False)')
+    parser.add_argument('--no-prefetch-phase2', action='store_true',
+                       help='Disable Phase 2 prefix prefetch onto destination GPU (default: enabled)')
     
     args = parser.parse_args()
     
@@ -1173,6 +1248,8 @@ Examples:
     results_with = None
     results_without = None
     
+    prefetch_phase2 = not args.no_prefetch_phase2
+
     if args.compare:
         # Run without kv-marketplace first (skip if --kv-marketplace-only is set)
         if not args.kv_marketplace_only:
@@ -1189,6 +1266,7 @@ Examples:
                 gpu_memory_utilization=args.gpu_memory_utilization,
                 tensor_parallel_size=args.tensor_parallel_size,
                 max_model_len=args.max_model_len,
+                prefetch_phase2=prefetch_phase2,
             )
         else:
             results_without = None
@@ -1207,6 +1285,7 @@ Examples:
             gpu_memory_utilization=args.gpu_memory_utilization,
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len,
+            prefetch_phase2=prefetch_phase2,
         )
         
         # Create comparison chart (only if both results exist)
@@ -1245,6 +1324,7 @@ Examples:
             gpu_memory_utilization=args.gpu_memory_utilization,
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len,
+            prefetch_phase2=prefetch_phase2,
         )
         
         if results:

@@ -105,6 +105,10 @@ if _ASYNC_IMPORT_COPY:
 else:
     logger.info("kv-marketplace: forcing stream sync after each import copy")
 
+_REHOME_AFTER_IMPORT = _env_flag('KV_MARKETPLACE_REHOME_AFTER_IMPORT')
+if _REHOME_AFTER_IMPORT:
+    logger.info("kv-marketplace: imported prefixes will be re-registered on destination GPUs")
+
 # File-based stats sharing for multiprocessing
 _stats_file = None
 _stats_lock_file = None
@@ -735,52 +739,8 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         
         # Validate meta before using it
         _validate_meta(meta)
-        
-        # Allocate destination KV cache
-        alloc_start = time.perf_counter()
-        dst_alloc = ctx['alloc_prefix'](lcp_len)
-        timings['alloc_prefix_ms'] = (time.perf_counter() - alloc_start) * 1000.0
-        logger.info(
-            "kv-marketplace: alloc_prefix elapsed %.2f ms (tokens=%d)",
-            timings['alloc_prefix_ms'], lcp_len
-        )
-        
-        # Require k_ptrs and v_ptrs to exist - fail loudly if missing
-        if 'k_ptrs' not in dst_alloc:
-            logger.error(
-                f"kv-marketplace: alloc_prefix returned dict missing 'k_ptrs' key. "
-                f"Returned keys: {list(dst_alloc.keys())}, type: {type(dst_alloc)}"
-            )
-            _import_misses += 1
-            _write_stats_to_file()
-            return None
-        
-        if 'v_ptrs' not in dst_alloc:
-            logger.error(
-                f"kv-marketplace: alloc_prefix returned dict missing 'v_ptrs' key. "
-                f"Returned keys: {list(dst_alloc.keys())}, type: {type(dst_alloc)}"
-            )
-            _import_misses += 1
-            _write_stats_to_file()
-            return None
-        
-        # Harden pointer validation before copying (length + nonzero)
         n_layers = meta['n_layers']
-        k_ptrs = dst_alloc['k_ptrs']
-        v_ptrs = dst_alloc['v_ptrs']
-        
-        if not _valid_ptr_list(k_ptrs, n_layers) or not _valid_ptr_list(v_ptrs, n_layers):
-            logger.error(
-                f"kv-marketplace: invalid dst ptrs "
-                f"(k_len={len(k_ptrs)}, v_len={len(v_ptrs)}, "
-                f"expected n_layers={n_layers}, "
-                f"k_ptrs={k_ptrs[:5] if len(k_ptrs) > 0 else []}, "
-                f"v_ptrs={v_ptrs[:5] if len(v_ptrs) > 0 else []}); treating as miss"
-            )
-            _import_misses += 1
-            _write_stats_to_file()
-            return None
-        
+
         # Require k_ptrs and v_ptrs to exist on handle - fail loudly if missing
         if not hasattr(handle, 'k_ptrs'):
             logger.error(
@@ -830,13 +790,6 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             _write_stats_to_file()
             return None
         
-        # Log the lengths you're about to use so you can see the mismatch instantly
-        logger.info(
-            "kv-marketplace: ptr lens: dst(k=%d,v=%d) src(k=%d,v=%d) n_layers=%d",
-            len(k_ptrs), len(v_ptrs),
-            len(handle_k_ptrs), len(handle_v_ptrs), n_layers
-        )
-        
         # Get stable device IDs for comparison
         handle_global_id = getattr(handle, 'device_global_id', None) or getattr(handle, 'device_uuid', None)
         current_global_id = get_stable_device_id(device_id)
@@ -846,18 +799,71 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         # Check if cache hit is on the same GPU using stable global ID
         # This is reliable across processes even when CUDA_VISIBLE_DEVICES makes both see device 0
         # Only compare when both IDs are available (not None)
-        is_same_gpu = (handle_global_id is not None and
-                      current_global_id is not None and
-                      handle_global_id == current_global_id)
+        is_same_gpu = (
+            handle_global_id is not None
+            and current_global_id is not None
+            and handle_global_id == current_global_id
+        )
+        serve_with_local_copy = is_same_gpu
+        if serve_with_local_copy:
+            logger.info(
+                "kv-marketplace: Cache hit on same GPU %s (global_id=%s, lcp_len=%s), "
+                "performing local reuse copy instead of skipping import",
+                device_id,
+                current_global_id,
+                lcp_len,
+            )
+
+        # Allocate destination KV cache only if we really need to import.
+        alloc_start = time.perf_counter()
+        dst_alloc = ctx['alloc_prefix'](lcp_len)
+        timings['alloc_prefix_ms'] = (time.perf_counter() - alloc_start) * 1000.0
+        logger.info(
+            "kv-marketplace: alloc_prefix elapsed %.2f ms (tokens=%d)",
+            timings['alloc_prefix_ms'], lcp_len
+        )
         
-        if is_same_gpu:
-            # Same GPU - let vLLM's native cache management handle local reuse
-            # This avoids unnecessary memory allocation and copying overhead
-            logger.info(f"kv-marketplace: Cache hit on same GPU {device_id} (global_id={current_global_id}, lcp_len={lcp_len}), skipping marketplace import (let vLLM handle local reuse)")
-            _local_hits += 1
+        # Require k_ptrs and v_ptrs to exist - fail loudly if missing
+        if 'k_ptrs' not in dst_alloc:
+            logger.error(
+                f"kv-marketplace: alloc_prefix returned dict missing 'k_ptrs' key. "
+                f"Returned keys: {list(dst_alloc.keys())}, type: {type(dst_alloc)}"
+            )
+            _import_misses += 1
             _write_stats_to_file()
             return None
         
+        if 'v_ptrs' not in dst_alloc:
+            logger.error(
+                f"kv-marketplace: alloc_prefix returned dict missing 'v_ptrs' key. "
+                f"Returned keys: {list(dst_alloc.keys())}, type: {type(dst_alloc)}"
+            )
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
+        
+        # Harden pointer validation before copying (length + nonzero)
+        k_ptrs = dst_alloc['k_ptrs']
+        v_ptrs = dst_alloc['v_ptrs']
+        
+        if not _valid_ptr_list(k_ptrs, n_layers) or not _valid_ptr_list(v_ptrs, n_layers):
+            logger.error(
+                f"kv-marketplace: invalid dst ptrs "
+                f"(k_len={len(k_ptrs)}, v_len={len(v_ptrs)}, "
+                f"expected n_layers={n_layers}, "
+                f"k_ptrs={k_ptrs[:5] if len(k_ptrs) > 0 else []}, "
+                f"v_ptrs={v_ptrs[:5] if len(v_ptrs) > 0 else []}); treating as miss"
+            )
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
+
+        logger.info(
+            "kv-marketplace: ptr lens: dst(k=%d,v=%d) src(k=%d,v=%d) n_layers=%d",
+            len(k_ptrs), len(v_ptrs),
+            len(handle_k_ptrs), len(handle_v_ptrs), n_layers
+        )
+
         # Cross-GPU cache hit - map source stable ID to local ordinal for P2P operations
         src_dev_local = None
         if handle_global_id:
@@ -885,7 +891,26 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             return None
         
         # Cross-GPU cache hit - proceed with marketplace import
-        logger.info(f"kv-marketplace: Cross-GPU cache hit found! src_dev={src_dev_local} (global_id={handle_global_id}), dst_dev={device_id} (global_id={current_global_id}), lcp_len={lcp_len}, proceeding with import")
+        if serve_with_local_copy:
+            logger.info(
+                "kv-marketplace: Local reuse hit found. src_dev=%s (global_id=%s), "
+                "dst_dev=%s (global_id=%s), lcp_len=%s, proceeding with in-place import",
+                src_dev_local,
+                handle_global_id,
+                device_id,
+                current_global_id,
+                lcp_len,
+            )
+        else:
+            logger.info(
+                "kv-marketplace: Cross-GPU cache hit found! src_dev=%s (global_id=%s), "
+                "dst_dev=%s (global_id=%s), lcp_len=%s, proceeding with import",
+                src_dev_local,
+                handle_global_id,
+                device_id,
+                current_global_id,
+                lcp_len,
+            )
         
         # Check peer access requirement using mapped local ordinals
         # Note: PeerCopy.ensure_peer_access has C++-level caching, so no need to cache here
@@ -963,23 +988,21 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         )
         timings['copy_kv_ms'] = (time.perf_counter() - copy_start) * 1000.0
 
-        # Register the freshly imported prefix on this device so follow-up
-        # requests in the same batch see a local handle and skip another import.
-        layout_meta_for_dst = dict(meta)
-        if dst_page_ranges:
-            layout_meta_for_dst['page_ranges'] = dst_page_ranges
-        elif 'page_ranges' in layout_meta_for_dst and not layout_meta_for_dst['page_ranges']:
-            # Avoid leaking empty structures into the registry
-            layout_meta_for_dst.pop('page_ranges')
-        _register_handle_for_device(
-            compat=compat,
-            prefix_hash=prefix_hash,
-            device_id=device_id,
-            k_ptrs=k_ptrs,
-            v_ptrs=v_ptrs,
-            length=lcp_len,
-            layout_meta=layout_meta_for_dst,
-        )
+        if _REHOME_AFTER_IMPORT:
+            layout_meta_for_dst = dict(meta)
+            if dst_page_ranges:
+                layout_meta_for_dst['page_ranges'] = dst_page_ranges
+            else:
+                layout_meta_for_dst.pop('page_ranges', None)
+            _register_handle_for_device(
+                compat=compat,
+                prefix_hash=prefix_hash,
+                device_id=device_id,
+                k_ptrs=k_ptrs,
+                v_ptrs=v_ptrs,
+                length=lcp_len,
+                layout_meta=layout_meta_for_dst,
+            )
         
         # Synchronize copy completion before suffix prefill only if requested.
         # By default we rely on stream ordering so prefill launches after the copy.
@@ -1003,9 +1026,12 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         logger.info(f"kv-marketplace: Successfully imported {lcp_len} tokens from GPU {src_dev_local} to GPU {device_id} (coalesced segments, synchronized)")
         
         # Track successful import
-        global _import_hits, _import_lcp_lengths, _cross_hits
+        global _import_hits, _import_lcp_lengths, _cross_hits, _local_hits
         _import_hits += 1
-        _cross_hits += 1
+        if serve_with_local_copy:
+            _local_hits += 1
+        else:
+            _cross_hits += 1
         _import_lcp_lengths.append(lcp_len)
         # Write to file for cross-process access
         _write_stats_to_file()
