@@ -241,6 +241,7 @@ def _write_stats_to_file():
         }
     }
     """
+    start = time.perf_counter()
     try:
         import os as os_module
         pid = os_module.getpid()
@@ -272,6 +273,8 @@ def _write_stats_to_file():
         with open(temp_file, 'w') as f:
             json.dump(existing_stats, f)
         os.replace(temp_file, stats_file)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.info("kv-marketplace: stats write completed in %.3f ms (pid=%s)", elapsed_ms, pid)
     except Exception as e:
         logger.warning(f"Failed to write stats to file: {e}")
 
