@@ -701,8 +701,7 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         # Handle page ranges from handle if available
         src_page_ranges = None
         if hasattr(handle, 'layout_meta') and handle.layout_meta:
-            # Could extract page ranges from handle if stored
-            pass
+            src_page_ranges = handle.layout_meta.get('page_ranges')
         
         # Get dtype size from cache config or compat
         dtype_size = 2  # fp16 default
@@ -861,18 +860,23 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         logger.debug(f"Exporting KV cache: device_id={device_id}, device_global_id={device_global_id}, device_uuid={device_uuid}")
         
         # Build KVHandle from context
+        page_ranges = kv_pages.get('page_ranges')
+        layout_meta = {
+            'n_layers': layout['n_layers'],
+            'n_kv_heads': layout['n_kv_heads'],
+            'head_dim': layout['head_dim'],
+            'page_size': layout['page_size'],
+            **layout.get('strides', {})
+        }
+        if page_ranges:
+            layout_meta['page_ranges'] = page_ranges
+        
         handle = KVHandle(
             device_id=device_id,  # Local ordinal (for backward compatibility)
             k_ptrs=k_ptrs,
             v_ptrs=v_ptrs,
             length=length,
-            layout_meta={
-                'n_layers': layout['n_layers'],
-                'n_kv_heads': layout['n_kv_heads'],
-                'head_dim': layout['head_dim'],
-                'page_size': layout['page_size'],
-                **layout.get('strides', {})
-            },
+            layout_meta=layout_meta,
             device_uuid=device_uuid,  # UUID (for backward compatibility)
             device_global_id=device_global_id  # Stable global ID (PCI bus ID or UUID, preferred)
         )
@@ -889,4 +893,3 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
     except Exception as e:
         logger.error(f"Error in after_prefill: {e}", exc_info=True)
         # Don't raise - export failure shouldn't break inference
-

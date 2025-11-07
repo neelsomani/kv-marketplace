@@ -45,7 +45,7 @@ To try cross-GPU KV import with vLLM, you must use the companion fork and branch
 - Repo: `neelsomani/vllm`
 - Branch: `vllm-kvm-dev`
 
-This fork adds two integration hooks (`before_prefill`, `after_prefill`) and a minimal plugin shim used by this project. Upstream vLLM will run, but it will not perform cross-GPU KV imports.
+This fork adds two integration hooks (`before_prefill`, `after_prefill`) and a minimal plugin shim used by this project.
 
 ## Installation
 
