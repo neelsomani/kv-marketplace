@@ -520,10 +520,6 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             _write_stats_to_file()
             return None
         
-        # Log layout and handle metadata for debugging
-        logger.info(f"layout from ctx: {layout}")
-        logger.info(f"handle.layout_meta: {getattr(handle, 'layout_meta', None)}")
-        
         # Use handle's layout_meta (authoritative) for the copy, with fallback to layout
         meta = handle.layout_meta or {
             'n_layers': layout['n_layers'],
