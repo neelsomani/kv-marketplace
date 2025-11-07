@@ -6,7 +6,7 @@ We propose a distributed inference runtime that enables cross-GPU reuse of trans
 
 The Cross-GPU KV Cache Marketplace treats these attention states as first-class, shareable artifacts. Each process exports completed prefix caches, indexed by a hash of the input token sequence and model version, into a distributed registry. Other processes with matching prefixes can import those caches directly via GPU-to-GPU Remote Direct Memory Access (RDMA) or NVLink peer copies, bypassing host memory and avoiding recomputation. The marketplace manages registration, eviction, and lifetime tracking of exported tensors, ensuring correctness and low-latency transfer.
 
-This design effectively transforms transformer inference into a cooperative caching network (a "memcached for attention"). In workloads such as chat serving, retrieval-augmented generation, or multi-tenant inference with common system prompts, it can eliminate repeated prefix computation, improving throughput and reducing GPU utilization by up to several times. Beyond efficiency, the framework opens new research avenues in distributed memory consistency for neural inference, prefix deduplication, and cache-aware load balancing across heterogeneous GPUs.
+This design effectively transforms transformer inference into a cooperative caching network (a "memcached for attention"). In workloads such as chat serving, retrieval-augmented generation, or multi-tenant inference with common system prompts, it can eliminate repeated prefix computation, improving throughput and reducing GPU utilization. Beyond efficiency, the framework opens new research avenues in distributed memory consistency for neural inference, prefix deduplication, and cache-aware load balancing across heterogeneous GPUs.
 
 ## Minimum Viable Prototype
 
@@ -16,7 +16,7 @@ This initial release will focus on node-local reuse of transformer KV tensors wi
   * import KV state before prefill when a matching prefix exists,
   * export KV state after prefill for later reuse.
 * A CUDA peer-to-peer and CUDA IPC transport component enabling direct movement of KV tensors across GPUs on the same machine.
-* A prefix registry supporting longest-common-prefix lookup using token IDs.
+* A prefix registry supporting exact-match prefix reuse (LCP planned).
 * Configuration compatibility enforcement (model parameters, tokenizer, positional encoding, memory layout, dtype).
 * Automatic fallback to standard execution when no applicable prefix is found.
 * Tests confirming that reuse preserves next-token outputs within expected floating-point tolerance.
@@ -32,6 +32,7 @@ The MVP will not include:
 * Tensor-parallel or pipeline-parallel sharded KV import.
 * Compression or quantization of KV tensors during transfer.
 * Integration with speculative decoding mechanisms.
+* Longest Common Prefix (LCP) matching to enable partial reuse even when prompts differ slightly.
 
 Future iterations may expand into these areas after the node-local integration path is complete and validated.
 

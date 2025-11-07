@@ -10,7 +10,7 @@ from .types import KVLayout, AllocatedKV
 from ..compat import KVCompat
 from ..registry import KVRegistry, KVHandle
 from ..registry_backend import FileBasedRegistryBackend
-from ..prefix_index import PrefixIndex
+from ..prefix_index import PrefixIndex, TrieNode
 from ..prefix_index_backend import FileBasedPrefixIndex
 from ..transport.p2p import PeerCopy
 from ..transport import p2p_cuda
@@ -293,14 +293,19 @@ def get_stats() -> dict:
     global _import_hits, _import_misses, _import_lcp_lengths, _local_hits, _cross_hits
     
     # Get in-process stats
+    # For registry_size, use the backend's size() method (works for both in-process and file-based)
+    # For prefix_index_size, use the size() method if available, otherwise fall back to _hash_to_length
+    registry_size = _registry.size() if hasattr(_registry, 'size') else len(_registry._registry)
+    prefix_index_size = _prefix_index.size() if hasattr(_prefix_index, 'size') else len(_prefix_index._hash_to_length)
+    
     local_stats = {
         'import_hits': _import_hits,
         'import_misses': _import_misses,
         'local_hits': _local_hits,
         'cross_hits': _cross_hits,
         'import_lcp_lengths': _import_lcp_lengths.copy(),
-        'registry_size': len(_registry._registry),
-        'prefix_index_size': len(_prefix_index._hash_to_length),
+        'registry_size': registry_size,
+        'prefix_index_size': prefix_index_size,
     }
     
     # Read aggregated stats from file (includes all worker processes)
@@ -309,6 +314,8 @@ def get_stats() -> dict:
     # File stats are aggregated across all worker processes (summed for hits/misses)
     # Use file stats as primary source since hooks run in worker processes
     # Also merge with local stats to handle cases where hooks might run in main process
+    # For registry_size and prefix_index_size, prefer the current actual size over stale file stats
+    # (file stats might be stale from previous runs, but current size is authoritative)
     merged_stats = {
         # File stats are aggregated (summed), so use them directly
         # They will be 0 if no worker processes have written yet
@@ -318,9 +325,10 @@ def get_stats() -> dict:
         'cross_hits': file_stats.get('cross_hits', 0),
         # Combine LCP lengths from both sources (deduplicate)
         'import_lcp_lengths': list(set(local_stats['import_lcp_lengths'] + file_stats.get('import_lcp_lengths', []))),
-        # For sizes, use max (one process might have more entries than others)
-        'registry_size': max(local_stats['registry_size'], file_stats['registry_size']),
-        'prefix_index_size': max(local_stats['prefix_index_size'], file_stats['prefix_index_size']),
+        # For sizes, always use the current actual size from local_stats (authoritative)
+        # File stats might be stale from previous runs, but current size reflects the actual state
+        'registry_size': local_stats['registry_size'],
+        'prefix_index_size': local_stats['prefix_index_size'],
     }
     
     return merged_stats
@@ -341,6 +349,76 @@ def reset_stats():
         _write_stats_to_file()
     except Exception as e:
         logger.warning(f"Failed to reset file stats: {e}")
+
+
+def clear_registry():
+    """Clear the registry and prefix index to ensure an empty cache.
+    
+    This clears all stored KV cache handles and prefix sequences.
+    For file-based backends, this clears the underlying files.
+    For in-process backends, this clears the internal data structures.
+    Also clears the stats file to remove stale statistics.
+    """
+    global _registry, _prefix_index
+    
+    # Clear registry
+    try:
+        if isinstance(_registry._backend, FileBasedRegistryBackend):
+            # For file-based backend, clear the registry file (create empty file if it doesn't exist)
+            lock_fd = _registry._backend._acquire_lock()
+            try:
+                _registry._backend._write_registry({})
+            finally:
+                _registry._backend._release_lock(lock_fd)
+        else:
+            # For in-process backend, clear the internal dict
+            _registry._backend._registry.clear()
+    except Exception as e:
+        logger.warning(f"Failed to clear registry: {e}")
+    
+    # Clear prefix index
+    try:
+        if isinstance(_prefix_index, FileBasedPrefixIndex):
+            # For file-based prefix index, clear the file (create empty file if it doesn't exist)
+            prefix_index_file = _prefix_index._prefix_index_file
+            lock_fd = _prefix_index._acquire_lock()
+            try:
+                _prefix_index._write_sequences([])
+            finally:
+                _prefix_index._release_lock(lock_fd)
+            # Also clear the in-memory trie
+            _prefix_index._root = TrieNode()
+            _prefix_index._hash_to_length.clear()
+        else:
+            # For in-process prefix index, clear the internal structures
+            _prefix_index._root = TrieNode()
+            _prefix_index._hash_to_length.clear()
+    except Exception as e:
+        logger.warning(f"Failed to clear prefix index: {e}")
+    
+    # Clear stats file to remove stale statistics
+    try:
+        stats_file = _get_stats_file_path()
+        if os.path.exists(stats_file):
+            os.remove(stats_file)
+        # Write empty stats to ensure file exists
+        _write_stats_to_file()
+    except Exception as e:
+        logger.warning(f"Failed to clear stats file: {e}")
+
+
+def get_registry_keys() -> List[Tuple[bytes, bytes]]:
+    """Get all keys in the registry.
+    
+    Returns:
+        List of (compat_checksum, prefix_hash) tuples
+    """
+    global _registry
+    try:
+        return _registry.list_keys()
+    except Exception as e:
+        logger.warning(f"Failed to get registry keys: {e}")
+        return []
 
 
 class VLLMImportCtx(TypedDict, total=False):

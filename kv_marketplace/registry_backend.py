@@ -11,7 +11,7 @@ import json
 import tempfile
 import fcntl
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Tuple, TYPE_CHECKING
+from typing import Optional, Dict, Tuple, List, TYPE_CHECKING
 
 # Import at runtime to avoid circular dependency
 # These will be imported when needed in methods
@@ -62,6 +62,15 @@ class RegistryBackend(ABC):
             Number of registered handles
         """
         pass
+    
+    @abstractmethod
+    def list_keys(self) -> List[Tuple[bytes, bytes]]:
+        """List all keys in the registry.
+        
+        Returns:
+            List of (compat_checksum, prefix_hash) tuples
+        """
+        pass
 
 
 class InProcessRegistryBackend(RegistryBackend):
@@ -93,6 +102,10 @@ class InProcessRegistryBackend(RegistryBackend):
     def size(self) -> int:
         """Get the number of registered handles."""
         return len(self._registry)
+    
+    def list_keys(self) -> List[Tuple[bytes, bytes]]:
+        """List all keys in the registry."""
+        return list(self._registry.keys())
 
 
 class FileBasedRegistryBackend(RegistryBackend):
@@ -222,5 +235,22 @@ class FileBasedRegistryBackend(RegistryBackend):
         try:
             registry = self._read_registry()
             return len(registry)
+        finally:
+            self._release_lock(lock_fd)
+    
+    def list_keys(self) -> List[Tuple[bytes, bytes]]:
+        """List all keys in the registry."""
+        lock_fd = self._acquire_lock()
+        try:
+            registry = self._read_registry()
+            keys = []
+            for key_str in registry.keys():
+                # Parse key string back to (compat_checksum, prefix_hash)
+                parts = key_str.split(':')
+                if len(parts) == 2:
+                    compat_checksum = bytes.fromhex(parts[0])
+                    prefix_hash = bytes.fromhex(parts[1])
+                    keys.append((compat_checksum, prefix_hash))
+            return keys
         finally:
             self._release_lock(lock_fd)

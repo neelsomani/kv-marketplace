@@ -42,13 +42,13 @@ def maybe_get_adapter_funcs():
     """Lazily import adapter functions only when kv-marketplace is enabled.
     
     Returns:
-        Tuple of (get_stats_fn, reset_stats_fn) or (None, None) if import fails
+        Tuple of (get_stats_fn, reset_stats_fn, clear_registry_fn, get_registry_keys_fn) or (None, None, None, None) if import fails
     """
     try:
-        from kv_marketplace.adapter.vllm import get_stats as _get_stats, reset_stats as _reset_stats
-        return _get_stats, _reset_stats
+        from kv_marketplace.adapter.vllm import get_stats as _get_stats, reset_stats as _reset_stats, clear_registry as _clear_registry, get_registry_keys as _get_registry_keys
+        return _get_stats, _reset_stats, _clear_registry, _get_registry_keys
     except Exception:
-        return None, None
+        return None, None, None, None
 
 
 def create_prefixes_from_system_prompt(system_prompt: str, num_prefixes: int = 10) -> List[str]:
@@ -453,16 +453,11 @@ def run_benchmark(
     phase1_prompts = [f"{prefix}\n\nUser: {user_prompt}\n\nAssistant:" 
                      for prefix, user_prompt in zip(prefixes, user_prompts_to_use)]
     
-    # Phase 2 prompts: scrambled prefixes (use random permutation)
-    import random
-    scrambled_prefixes = prefixes.copy()
-    random.seed(42)  # For reproducibility
-    random.shuffle(scrambled_prefixes)
-    phase2_prompts = [f"{prefix}\n\nUser: {user_prompt}\n\nAssistant:" 
-                     for prefix, user_prompt in zip(scrambled_prefixes, user_prompts_to_use)]
+    # Phase 2 prompts: same as Phase 1 (to test cross-GPU imports with matching hashes)
+    phase2_prompts = phase1_prompts.copy()
     
     print(f"\nPhase 1: {len(phase1_prompts)} prompts (warm-up, batched)")
-    print(f"Phase 2: {len(phase2_prompts)} prompts (test with scrambled prefixes, batched)")
+    print(f"Phase 2: {len(phase2_prompts)} prompts (test with same prompts on different GPU, batched)")
     
     # Only enable file-based backend if kv-marketplace is enabled and we have multiple GPUs
     # This allows sharing registry across processes on the same machine
@@ -486,14 +481,21 @@ def run_benchmark(
     # and translate to local ordinals at import time. This requires adapter changes - see kv_marketplace/adapter/vllm.py
     
     # Lazy import adapter functions only if kv-marketplace is enabled
-    get_stats_fn, reset_stats_fn = None, None
+    get_stats_fn, reset_stats_fn, clear_registry_fn, get_registry_keys_fn = None, None, None, None
     if kv_marketplace:
-        get_stats_fn, reset_stats_fn = maybe_get_adapter_funcs()
+        get_stats_fn, reset_stats_fn, clear_registry_fn, get_registry_keys_fn = maybe_get_adapter_funcs()
         if reset_stats_fn:
             try:
                 reset_stats_fn()
             except Exception:
                 pass
+        # Clear registry before first run to ensure empty cache
+        if clear_registry_fn:
+            try:
+                clear_registry_fn()
+                print("Cleared registry and prefix index to ensure empty cache")
+            except Exception as e:
+                print(f"Warning: Failed to clear registry: {e}")
     
     # Shared kwargs for both child processes
     shared_kwargs = {
@@ -818,6 +820,9 @@ Examples:
 
   # Run comparison (with and without kv-marketplace)
   python vllm_dual_gpu_demo.py --model gpt2 --compare
+
+  # Run only kv-marketplace version (skip baseline when using --compare)
+  python vllm_dual_gpu_demo.py --model gpt2 --compare --kv-marketplace-only
         """
     )
     
@@ -853,6 +858,8 @@ Examples:
                        help='Disable kv-marketplace (default: enabled)')
     parser.add_argument('--save-results', type=str, default=None,
                        help='Save benchmark results to JSON file (e.g., results.json)')
+    parser.add_argument('--kv-marketplace-only', action='store_true',
+                       help='Run only kv-marketplace version (skip baseline when using --compare)')
     
     args = parser.parse_args()
     
@@ -878,21 +885,24 @@ Examples:
     results_without = None
     
     if args.compare:
-        # Run without kv-marketplace first
-        print("\n" + "="*80)
-        print("  RUNNING WITHOUT kv-marketplace")
-        print("="*80)
-        results_without = run_benchmark(
-            model=args.model,
-            system_prompt=args.system_prompt,
-            user_prompts=args.user_prompts,
-            num_runs=args.num_runs,
-            kv_marketplace=False,
-            kv_min_prefix=args.kv_min_prefix,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            tensor_parallel_size=args.tensor_parallel_size,
-            max_model_len=args.max_model_len,
-        )
+        # Run without kv-marketplace first (skip if --kv-marketplace-only is set)
+        if not args.kv_marketplace_only:
+            print("\n" + "="*80)
+            print("  RUNNING WITHOUT kv-marketplace")
+            print("="*80)
+            results_without = run_benchmark(
+                model=args.model,
+                system_prompt=args.system_prompt,
+                user_prompts=args.user_prompts,
+                num_runs=args.num_runs,
+                kv_marketplace=False,
+                kv_min_prefix=args.kv_min_prefix,
+                gpu_memory_utilization=args.gpu_memory_utilization,
+                tensor_parallel_size=args.tensor_parallel_size,
+                max_model_len=args.max_model_len,
+            )
+        else:
+            results_without = None
         
         # Run with kv-marketplace
         print("\n" + "="*80)
@@ -910,20 +920,27 @@ Examples:
             max_model_len=args.max_model_len,
         )
         
-        # Create comparison chart
+        # Create comparison chart (only if both results exist)
         if results_with and results_without:
             create_comparison_chart(results_with, results_without)
+        elif args.kv_marketplace_only:
+            print("\nSkipped baseline run (--kv-marketplace-only flag set)")
         
         # Save results if requested
         if args.save_results:
-            combined_results = {
-                'without_kv_marketplace': results_without,
-                'with_kv_marketplace': results_with,
-                'comparison': {
-                    'latency_improvement_pct': ((results_without.get('avg_latency', 0) - results_with.get('avg_latency', 0)) / results_without.get('avg_latency', 1)) * 100 if results_without.get('avg_latency', 0) > 0 else 0,
-                    'throughput_improvement_pct': ((results_with.get('throughput', 0) - results_without.get('throughput', 0)) / results_without.get('throughput', 1)) * 100 if results_without.get('throughput', 0) > 0 else 0,
+            if results_without:
+                combined_results = {
+                    'without_kv_marketplace': results_without,
+                    'with_kv_marketplace': results_with,
+                    'comparison': {
+                        'latency_improvement_pct': ((results_without.get('avg_latency', 0) - results_with.get('avg_latency', 0)) / results_without.get('avg_latency', 1)) * 100 if results_without.get('avg_latency', 0) > 0 else 0,
+                        'throughput_improvement_pct': ((results_with.get('throughput', 0) - results_without.get('throughput', 0)) / results_without.get('throughput', 1)) * 100 if results_without.get('throughput', 0) > 0 else 0,
+                    }
                 }
-            }
+            else:
+                combined_results = {
+                    'with_kv_marketplace': results_with,
+                }
             save_results_to_file(combined_results, args.save_results)
     
     else:
@@ -947,6 +964,24 @@ Examples:
             # Save results if requested
             if args.save_results:
                 save_results_to_file(results, args.save_results)
+    
+    # Print registry keys at the end if kv-marketplace is enabled
+    kv_marketplace_final = not args.no_kv_marketplace if not args.compare else True
+    if kv_marketplace_final:
+        get_stats_fn_final, _, _, get_registry_keys_fn_final = maybe_get_adapter_funcs()
+        if get_registry_keys_fn_final:
+            try:
+                registry_keys = get_registry_keys_fn_final()
+                print(f"\n{'='*80}")
+                print(f"  Registry Keys ({len(registry_keys)} total)")
+                print(f"{'='*80}")
+                if registry_keys:
+                    for i, (compat_checksum, prefix_hash) in enumerate(registry_keys, 1):
+                        print(f"  {i}. compat_checksum={compat_checksum.hex()[:16]}... prefix_hash={prefix_hash.hex()[:16]}...")
+                else:
+                    print("  (Registry is empty)")
+            except Exception as e:
+                print(f"\nWarning: Could not retrieve registry keys: {e}")
     
     print("\n✓ Demo completed!")
 

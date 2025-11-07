@@ -1,6 +1,6 @@
 """KVRegistry: map (compat, prefix hash) → KVHandle with pluggable backends."""
 
-from typing import Optional
+from typing import Optional, List, Tuple
 from .compat import KVCompat
 from .registry_backend import RegistryBackend, InProcessRegistryBackend
 
@@ -95,6 +95,14 @@ class KVRegistry:
             Number of registered handles
         """
         return self._backend.size()
+    
+    def list_keys(self) -> List[Tuple[bytes, bytes]]:
+        """List all keys in the registry.
+        
+        Returns:
+            List of (compat_checksum, prefix_hash) tuples
+        """
+        return self._backend.list_keys()
     
     @property
     def _registry(self):
