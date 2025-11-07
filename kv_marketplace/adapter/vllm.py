@@ -442,6 +442,23 @@ class VLLMExportCtx(TypedDict):
     length: int
 
 
+def _validate_meta(meta: dict):
+    """Validate that meta dictionary has all required fields with valid values."""
+    for k in ("n_layers", "n_kv_heads", "head_dim", "page_size"):
+        v = meta.get(k)
+        if not isinstance(v, int) or v <= 0:
+            raise RuntimeError(f"[kv-mkt] invalid meta[{k}]={v}")
+
+
+def _valid_ptr_list(ptrs, n_layers):
+    """Validate pointer list: must be list, correct length, integers (not bools), and nonzero."""
+    # ints and nonzero
+    if not isinstance(ptrs, list) or len(ptrs) != n_layers:
+        return False
+    # prevent bools sneaking in (bool is subclass of int)
+    return all(isinstance(p, int) and not isinstance(p, bool) and p != 0 for p in ptrs)
+
+
 def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
     """Hook called before prefill to attempt KV cache import.
     
@@ -503,6 +520,114 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             _write_stats_to_file()
             return None
         
+        # Log layout and handle metadata for debugging
+        logger.info(f"layout from ctx: {layout}")
+        logger.info(f"handle.layout_meta: {getattr(handle, 'layout_meta', None)}")
+        
+        # Use handle's layout_meta (authoritative) for the copy, with fallback to layout
+        meta = handle.layout_meta or {
+            'n_layers': layout['n_layers'],
+            'n_kv_heads': layout['n_kv_heads'] or layout.get('n_heads', 0),
+            'head_dim': layout['head_dim'],
+            'page_size': layout['page_size'],
+            **layout.get('strides', {})
+        }
+        
+        # Validate meta before using it
+        _validate_meta(meta)
+        
+        # Allocate destination KV cache
+        dst_alloc = ctx['alloc_prefix'](lcp_len)
+        
+        # Require k_ptrs and v_ptrs to exist - fail loudly if missing
+        if 'k_ptrs' not in dst_alloc:
+            logger.error(
+                f"kv-marketplace: alloc_prefix returned dict missing 'k_ptrs' key. "
+                f"Returned keys: {list(dst_alloc.keys())}, type: {type(dst_alloc)}"
+            )
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
+        
+        if 'v_ptrs' not in dst_alloc:
+            logger.error(
+                f"kv-marketplace: alloc_prefix returned dict missing 'v_ptrs' key. "
+                f"Returned keys: {list(dst_alloc.keys())}, type: {type(dst_alloc)}"
+            )
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
+        
+        # Harden pointer validation before copying (length + nonzero)
+        n_layers = meta['n_layers']
+        k_ptrs = dst_alloc['k_ptrs']
+        v_ptrs = dst_alloc['v_ptrs']
+        
+        if not _valid_ptr_list(k_ptrs, n_layers) or not _valid_ptr_list(v_ptrs, n_layers):
+            logger.error(
+                f"kv-marketplace: invalid dst ptrs "
+                f"(k_len={len(k_ptrs)}, v_len={len(v_ptrs)}, "
+                f"expected n_layers={n_layers}, "
+                f"k_ptrs={k_ptrs[:5] if len(k_ptrs) > 0 else []}, "
+                f"v_ptrs={v_ptrs[:5] if len(v_ptrs) > 0 else []}); treating as miss"
+            )
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
+        
+        # Require k_ptrs and v_ptrs to exist on handle - fail loudly if missing
+        if not hasattr(handle, 'k_ptrs'):
+            logger.error(
+                f"kv-marketplace: handle missing 'k_ptrs' attribute. "
+                f"Handle type: {type(handle)}, handle attributes: {dir(handle)}"
+            )
+            try:
+                _registry.delete(compat, prefix_hash)
+            except Exception:
+                pass
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
+        
+        if not hasattr(handle, 'v_ptrs'):
+            logger.error(
+                f"kv-marketplace: handle missing 'v_ptrs' attribute. "
+                f"Handle type: {type(handle)}, handle attributes: {dir(handle)}"
+            )
+            try:
+                _registry.delete(compat, prefix_hash)
+            except Exception:
+                pass
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
+        
+        handle_k_ptrs = handle.k_ptrs
+        handle_v_ptrs = handle.v_ptrs
+        
+        if not _valid_ptr_list(handle_k_ptrs, n_layers) or not _valid_ptr_list(handle_v_ptrs, n_layers):
+            logger.error(
+                f"kv-marketplace: invalid src ptrs in handle "
+                f"(k_len={len(handle_k_ptrs)}, v_len={len(handle_v_ptrs)}, "
+                f"expected n_layers={n_layers}, "
+                f"k_ptrs={handle_k_ptrs[:5] if len(handle_k_ptrs) > 0 else []}, "
+                f"v_ptrs={handle_v_ptrs[:5] if len(handle_v_ptrs) > 0 else []}); dropping handle"
+            )
+            try:
+                _registry.delete(compat, prefix_hash)
+            except Exception:
+                pass
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
+        
+        # Log the lengths you're about to use so you can see the mismatch instantly
+        logger.info(
+            "kv-marketplace: ptr lens: dst(k=%d,v=%d) src(k=%d,v=%d) n_layers=%d",
+            len(k_ptrs), len(v_ptrs),
+            len(handle_k_ptrs), len(handle_v_ptrs), n_layers
+        )
+        
         # Get stable device IDs for comparison
         handle_global_id = getattr(handle, 'device_global_id', None) or getattr(handle, 'device_uuid', None)
         current_global_id = get_stable_device_id(device_id)
@@ -553,9 +678,6 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         # Cross-GPU cache hit - proceed with marketplace import
         logger.info(f"kv-marketplace: Cross-GPU cache hit found! src_dev={src_dev_local} (global_id={handle_global_id}), dst_dev={device_id} (global_id={current_global_id}), lcp_len={lcp_len}, proceeding with import")
         
-        # Allocate destination KV cache
-        dst_alloc = ctx['alloc_prefix'](lcp_len)
-        
         # Check peer access requirement using mapped local ordinals
         # Note: PeerCopy.ensure_peer_access has C++-level caching, so no need to cache here
         allow_pcie = ctx.get('allow_pcie', False)
@@ -582,17 +704,29 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             # Could extract page ranges from handle if stored
             pass
         
-        # adapter.vllm.before_prefill(...)
-        # Sanity check: verify destination KV pointers are valid before copy
-        if any(p == 0 for p in dst_alloc['k_ptrs']) or any(p == 0 for p in dst_alloc['v_ptrs']):
-            logger.warning("kv-marketplace: dst KV ptrs are zero; treating as miss")
-            _import_misses += 1
-            _write_stats_to_file()
-            return None
+        # Get dtype size from cache config or compat
+        dtype_size = 2  # fp16 default
+        try:
+            # Try to get from compat's layout_config
+            cache_dtype = ''
+            if isinstance(compat, KVCompat):
+                cache_dtype = str(compat.layout_config.get('dtype', '')).lower()
+            elif isinstance(compat, dict):
+                cache_dtype = str(compat.get('kv_layout', {}).get('dtype', '')).lower()
+            
+            if "float8" in cache_dtype or "fp8" in cache_dtype:
+                dtype_size = 1
+            elif "float16" in cache_dtype or "fp16" in cache_dtype or "half" in cache_dtype:
+                dtype_size = 2
+            elif "bfloat16" in cache_dtype or "bf16" in cache_dtype:
+                dtype_size = 2
+            elif "float32" in cache_dtype or "fp32" in cache_dtype:
+                dtype_size = 4
+        except Exception:
+            pass
         
-        # Log bytes to copy and estimate expected bandwidth
-        bytes_per_tok = layout['n_layers'] * layout['n_kv_heads'] * layout['head_dim'] * 2  # K+V
-        bytes_per_tok *= 2  # fp16
+        # Log bytes to copy and estimate expected bandwidth using meta (authoritative)
+        bytes_per_tok = meta['n_layers'] * meta['n_kv_heads'] * meta['head_dim'] * 2 * dtype_size  # K and V
         nbytes = bytes_per_tok * lcp_len
         logger.info(f"kv-marketplace: will copy ~{nbytes/1e6:.1f} MB for LCP={lcp_len}")
         
@@ -601,18 +735,18 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         # Pass the stream directly - PeerCopy.copy_kv accepts int (CUDA stream pointer)
         PeerCopy.copy_kv(
             dst_dev=device_id,
-            dst_k_ptrs=dst_alloc['k_ptrs'],
-            dst_v_ptrs=dst_alloc['v_ptrs'],
+            dst_k_ptrs=k_ptrs,
+            dst_v_ptrs=v_ptrs,
             src_dev=src_dev_local,  # Use mapped local ordinal, not handle.device_id
-            src_k_ptrs=handle.k_ptrs,
-            src_v_ptrs=handle.v_ptrs,
-            n_layers=layout['n_layers'],
+            src_k_ptrs=handle_k_ptrs,
+            src_v_ptrs=handle_v_ptrs,
+            n_layers=meta['n_layers'],
             length=lcp_len,
             meta={
-                'n_kv_heads': layout['n_kv_heads'],
-                'head_dim': layout['head_dim'],
-                'page_size': layout['page_size'],
-                **layout.get('strides', {})
+                'n_kv_heads': meta['n_kv_heads'],
+                'head_dim': meta['head_dim'],
+                'page_size': meta['page_size'],
+                **meta.get('strides', {})
             },
             stream=ctx['stream'],  # Pass int stream pointer directly
             dst_page_ranges=dst_page_ranges,
@@ -671,9 +805,25 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         # Only export the prefix up to length
         prefix_tokens = tokens[:length]
         
-        # Check if we have valid pointers
-        k_ptrs = kv_pages.get('k_ptrs', [])
-        v_ptrs = kv_pages.get('v_ptrs', [])
+        # Require k_ptrs and v_ptrs to exist - fail loudly if missing
+        if 'k_ptrs' not in kv_pages:
+            logger.error(
+                f"kv-marketplace: kv_pages dict missing 'k_ptrs' key. "
+                f"Returned keys: {list(kv_pages.keys())}, type: {type(kv_pages)}, "
+                f"length={length}, device_id={device_id}"
+            )
+            return
+        
+        if 'v_ptrs' not in kv_pages:
+            logger.error(
+                f"kv-marketplace: kv_pages dict missing 'v_ptrs' key. "
+                f"Returned keys: {list(kv_pages.keys())}, type: {type(kv_pages)}, "
+                f"length={length}, device_id={device_id}"
+            )
+            return
+        
+        k_ptrs = kv_pages['k_ptrs']
+        v_ptrs = kv_pages['v_ptrs']
         
         """
         logger.debug(
@@ -686,9 +836,11 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         
         # If pointers are empty, we can't export (get_prefill_pages may have failed)
         if not k_ptrs or not v_ptrs:
-            logger.warning(
-                f"KV cache pointers are empty for export: length={length}, "
-                f"k_ptrs={len(k_ptrs)}, v_ptrs={len(v_ptrs)}. "
+            logger.error(
+                f"kv-marketplace: KV cache pointers are empty for export: length={length}, "
+                f"k_ptrs={len(k_ptrs)}, v_ptrs={len(v_ptrs)}, "
+                f"k_ptrs={k_ptrs[:5] if len(k_ptrs) > 0 else []}, "
+                f"v_ptrs={v_ptrs[:5] if len(v_ptrs) > 0 else []}. "
                 f"This may indicate get_prefill_pages needs implementation or blocks aren't available yet."
             )
             return
