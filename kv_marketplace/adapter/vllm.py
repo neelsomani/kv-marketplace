@@ -4,6 +4,7 @@ import logging
 import json
 import os
 import tempfile
+import time
 from typing import Callable, Optional, Tuple, List, TypedDict
 import torch
 from .types import KVLayout, AllocatedKV
@@ -469,6 +470,8 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         Tuple of (lcp_len, dst_alloc) if import succeeds, None otherwise
     """
     global _import_misses, _import_hits, _local_hits, _cross_hits
+    timings = {}
+    total_start = time.perf_counter()
     
     try:
         # Get compatibility from context
@@ -494,7 +497,9 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         # Find longest common prefix using prefix index
         prefix_index_size = _prefix_index.size()
         # logger.debug(f"kv-marketplace before_prefill: Looking for LCP in prefix_index (size={prefix_index_size}, tokens_len={len(tokens)}, first_10_tokens={tokens[:10]})")
+        t = time.perf_counter()
         lcp_result = _prefix_index.find_lcp(tokens)
+        timings['find_lcp_ms'] = (time.perf_counter() - t) * 1000.0
         if lcp_result is None:
             logger.debug(f"kv-marketplace before_prefill: No LCP found for tokens (length={len(tokens)}, prefix_index_size={prefix_index_size})")
             _import_misses += 1
@@ -513,7 +518,9 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         
         # Lookup handle in registry
         # logger.debug(f"kv-marketplace before_prefill: Looking up handle in registry (size={_registry.size()}, compat_hash={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...)")
+        t = time.perf_counter()
         handle = _registry.lookup(compat, prefix_hash)
+        timings['registry_lookup_ms'] = (time.perf_counter() - t) * 1000.0
         if handle is None:
             logger.debug(f"kv-marketplace before_prefill: No handle found in registry for compat/prefix_hash")
             _import_misses += 1
@@ -533,7 +540,13 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         _validate_meta(meta)
         
         # Allocate destination KV cache
+        alloc_start = time.perf_counter()
         dst_alloc = ctx['alloc_prefix'](lcp_len)
+        timings['alloc_prefix_ms'] = (time.perf_counter() - alloc_start) * 1000.0
+        logger.info(
+            "kv-marketplace: alloc_prefix elapsed %.2f ms (tokens=%d)",
+            timings['alloc_prefix_ms'], lcp_len
+        )
         
         # Require k_ptrs and v_ptrs to exist - fail loudly if missing
         if 'k_ptrs' not in dst_alloc:
@@ -728,6 +741,7 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         # Copy KV tensors from source to destination with coalescing
         # Use mapped local ordinals (src_dev_local, device_id) for correct P2P routing
         # Pass the stream directly - PeerCopy.copy_kv accepts int (CUDA stream pointer)
+        copy_start = time.perf_counter()
         PeerCopy.copy_kv(
             dst_dev=device_id,
             dst_k_ptrs=k_ptrs,
@@ -747,11 +761,24 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             dst_page_ranges=dst_page_ranges,
             src_page_ranges=src_page_ranges
         )
+        timings['copy_kv_ms'] = (time.perf_counter() - copy_start) * 1000.0
         
         # Synchronize copy completion before suffix prefill (MVP requirement)
         # This ensures the imported KV cache is fully materialized before vLLM continues
+        sync_start = time.perf_counter()
         PeerCopy.synchronize_stream(ctx['stream'])
+        timings['sync_stream_ms'] = (time.perf_counter() - sync_start) * 1000.0
         
+        total_duration_ms = (time.perf_counter() - total_start) * 1000.0
+        logger.info(
+            "kv-marketplace timings: find_lcp=%.2f ms registry=%.2f ms alloc=%.2f ms copy=%.2f ms sync=%.2f ms total=%.2f ms",
+            timings.get('find_lcp_ms', 0.0),
+            timings.get('registry_lookup_ms', 0.0),
+            timings.get('alloc_prefix_ms', 0.0),
+            timings.get('copy_kv_ms', 0.0),
+            timings.get('sync_stream_ms', 0.0),
+            total_duration_ms,
+        )
         logger.info(f"kv-marketplace: Successfully imported {lcp_len} tokens from GPU {src_dev_local} to GPU {device_id} (coalesced segments, synchronized)")
         
         # Track successful import
