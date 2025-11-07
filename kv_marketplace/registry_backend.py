@@ -10,6 +10,7 @@ import os
 import json
 import tempfile
 import fcntl
+import time
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Tuple, List, TYPE_CHECKING
 
@@ -263,12 +264,14 @@ class FileBasedRegistryBackend(RegistryBackend):
 
 
 class SharedMemoryRegistryBackend(RegistryBackend):
-    """Shared-memory registry backend using an in-memory JSON store."""
+    """Shared-memory registry backend with a per-process snapshot cache."""
 
     def __init__(
         self,
         shm_name: Optional[str] = None,
         size_bytes: Optional[int] = None,
+        snapshot_ttl: float = 5.0,
+        local_cache_max_entries: int = 4096,
     ) -> None:
         name = shm_name or 'kv_marketplace_registry'
         size = size_bytes or (8 * 1024 * 1024)
@@ -277,6 +280,10 @@ class SharedMemoryRegistryBackend(RegistryBackend):
             size_bytes=size,
             default_factory=dict,
         )
+        self._snapshot_ttl = max(0.0, snapshot_ttl)
+        self._local_cache_max_entries = max(1, local_cache_max_entries)
+        self._local_cache: Dict[str, 'KVHandle'] = {}
+        self._cache_expiry: float = 0.0
 
     def _make_key(self, compat: 'KVCompat', prefix_hash: bytes) -> str:
         return f"{compat.checksum.hex()}:{prefix_hash.hex()}"
@@ -320,14 +327,16 @@ class SharedMemoryRegistryBackend(RegistryBackend):
             registry[key] = serialized
 
         self._store.update(_mutator)
+        self._local_cache[key] = handle
 
     def lookup(self, compat: 'KVCompat', prefix_hash: bytes) -> Optional['KVHandle']:
         key = self._make_key(compat, prefix_hash)
-        registry = self._store.load(shared=True)
-        entry = registry.get(key)
-        if entry is None:
-            return None
-        return self._deserialize_handle(entry)
+        handle = self._local_cache.get(key)
+        if handle is not None:
+            return handle
+
+        self._refresh_snapshot(force=True)
+        return self._local_cache.get(key)
 
     def remove(self, compat: 'KVCompat', prefix_hash: bytes) -> None:
         key = self._make_key(compat, prefix_hash)
@@ -336,6 +345,7 @@ class SharedMemoryRegistryBackend(RegistryBackend):
             registry.pop(key, None)
 
         self._store.update(_mutator)
+        self._local_cache.pop(key, None)
 
     def size(self) -> int:
         registry = self._store.load(shared=True)
@@ -356,3 +366,26 @@ class SharedMemoryRegistryBackend(RegistryBackend):
 
     def close(self) -> None:
         self._store.close()
+
+    # ------------------------------------------------------------------
+    # Snapshot cache helpers
+    # ------------------------------------------------------------------
+    def _refresh_snapshot(self, force: bool = False) -> None:
+        if not force and self._snapshot_ttl > 0:
+            if self._cache_expiry > time.monotonic():
+                return
+
+        registry = self._store.load(shared=True)
+        self._local_cache.clear()
+        for idx, (key_str, entry) in enumerate(registry.items()):
+            if idx >= self._local_cache_max_entries:
+                break
+            try:
+                self._local_cache[key_str] = self._deserialize_handle(entry)
+            except Exception:
+                continue
+
+        if self._snapshot_ttl > 0:
+            self._cache_expiry = time.monotonic() + self._snapshot_ttl
+        else:
+            self._cache_expiry = 0.0

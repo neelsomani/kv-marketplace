@@ -139,6 +139,48 @@ def _invalidate_handle_cache(key: Tuple[bytes, bytes]):
     _handle_cache.pop(key, None)
 
 
+def _register_handle_for_device(
+    compat: KVCompat,
+    prefix_hash: bytes,
+    device_id: int,
+    k_ptrs: list,
+    v_ptrs: list,
+    length: int,
+    layout_meta: dict,
+) -> None:
+    """Register a KV handle that already resides on the current device.
+
+    This is used both when exporting freshly computed prefixes (after_prefill)
+    and immediately after a cross-device import so that subsequent requests in
+    the same batch observe a local handle instead of paying another import.
+    """
+    cache_key = _handle_cache_key(compat, prefix_hash)
+    try:
+        device_global_id = get_stable_device_id(device_id)
+        device_uuid = None
+        if hasattr(p2p_cuda, 'get_device_uuid'):
+            device_uuid = p2p_cuda.get_device_uuid(device_id)
+
+        handle = KVHandle(
+            device_id=device_id,
+            k_ptrs=k_ptrs,
+            v_ptrs=v_ptrs,
+            length=length,
+            layout_meta=layout_meta,
+            device_uuid=device_uuid,
+            device_global_id=device_global_id,
+        )
+        _registry.register(compat, prefix_hash, handle)
+        _cache_handle(cache_key, handle)
+        _write_stats_to_file()
+    except Exception as exc:
+        logger.warning(
+            "kv-marketplace: failed to register local handle for device %s: %s",
+            device_id,
+            exc,
+        )
+
+
 def get_stable_device_id(local_device_id: int) -> Optional[str]:
     """Get a stable, globally unique device identifier.
     
@@ -920,6 +962,24 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             src_page_ranges=src_page_ranges
         )
         timings['copy_kv_ms'] = (time.perf_counter() - copy_start) * 1000.0
+
+        # Register the freshly imported prefix on this device so follow-up
+        # requests in the same batch see a local handle and skip another import.
+        layout_meta_for_dst = dict(meta)
+        if dst_page_ranges:
+            layout_meta_for_dst['page_ranges'] = dst_page_ranges
+        elif 'page_ranges' in layout_meta_for_dst and not layout_meta_for_dst['page_ranges']:
+            # Avoid leaking empty structures into the registry
+            layout_meta_for_dst.pop('page_ranges')
+        _register_handle_for_device(
+            compat=compat,
+            prefix_hash=prefix_hash,
+            device_id=device_id,
+            k_ptrs=k_ptrs,
+            v_ptrs=v_ptrs,
+            length=lcp_len,
+            layout_meta=layout_meta_for_dst,
+        )
         
         # Synchronize copy completion before suffix prefill only if requested.
         # By default we rely on stream ordering so prefill launches after the copy.
@@ -1030,19 +1090,6 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         
         # Compute prefix hash and insert into prefix index
         prefix_hash = _prefix_index.insert(prefix_tokens)
-        cache_key = _handle_cache_key(compat, prefix_hash)
-        
-        # Get stable globally unique device identifier (PCI bus ID or UUID)
-        # This ensures correct device identification even when CUDA_VISIBLE_DEVICES
-        # makes each process see its GPU as device 0
-        device_global_id = get_stable_device_id(device_id)
-        
-        # Also get UUID for backward compatibility
-        device_uuid = None
-        if hasattr(p2p_cuda, 'get_device_uuid'):
-            device_uuid = p2p_cuda.get_device_uuid(device_id)
-        
-        logger.debug(f"Exporting KV cache: device_id={device_id}, device_global_id={device_global_id}, device_uuid={device_uuid}")
         
         # Build KVHandle from context
         page_ranges = kv_pages.get('page_ranges')
@@ -1055,23 +1102,16 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         }
         if page_ranges:
             layout_meta['page_ranges'] = page_ranges
-        
-        handle = KVHandle(
-            device_id=device_id,  # Local ordinal (for backward compatibility)
+
+        _register_handle_for_device(
+            compat=compat,
+            prefix_hash=prefix_hash,
+            device_id=device_id,
             k_ptrs=k_ptrs,
             v_ptrs=v_ptrs,
             length=length,
             layout_meta=layout_meta,
-            device_uuid=device_uuid,  # UUID (for backward compatibility)
-            device_global_id=device_global_id  # Stable global ID (PCI bus ID or UUID, preferred)
         )
-        
-        # Register in registry
-        _registry.register(compat, prefix_hash, handle)
-        _cache_handle(cache_key, handle)
-        
-        # Update file stats (registry size changed)
-        _write_stats_to_file()
         
         logger.debug(f"Exported KV cache: length={length}, device={device_id}, prefix_hash={prefix_hash.hex()[:8]}..., "
                    f"num_blocks={len(k_ptrs)}")
