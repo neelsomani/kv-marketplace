@@ -505,10 +505,10 @@ def run_benchmark(
     # Do NOT delete the registry between phases - only clear stats, not the registry itself
     import torch
     if torch.cuda.is_available() and torch.cuda.device_count() > 1 and kv_marketplace:
-        os.environ['KV_MARKETPLACE_FILE_BACKEND'] = '1'
-        print(f"Detected {torch.cuda.device_count()} GPUs, file-based registry backend enabled for cross-process sharing")
-    else:
+        # Use shared-memory backend for cross-process sharing; file backend adds heavy IO.
         os.environ.pop('KV_MARKETPLACE_FILE_BACKEND', None)
+        os.environ.setdefault('KV_MARKETPLACE_SHM_BACKEND', '1')
+        print(f"Detected {torch.cuda.device_count()} GPUs, shared-memory registry backend enabled for cross-process sharing")
     
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         print("ERROR: Need at least 2 GPUs for cross-GPU benchmark")
