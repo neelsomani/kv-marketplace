@@ -582,6 +582,20 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             # Could extract page ranges from handle if stored
             pass
         
+        # adapter.vllm.before_prefill(...)
+        # Sanity check: verify destination KV pointers are valid before copy
+        if any(p == 0 for p in dst_alloc['k_ptrs']) or any(p == 0 for p in dst_alloc['v_ptrs']):
+            logger.warning("kv-marketplace: dst KV ptrs are zero; treating as miss")
+            _import_misses += 1
+            _write_stats_to_file()
+            return None
+        
+        # Log bytes to copy and estimate expected bandwidth
+        bytes_per_tok = layout['n_layers'] * layout['n_kv_heads'] * layout['head_dim'] * 2  # K+V
+        bytes_per_tok *= 2  # fp16
+        nbytes = bytes_per_tok * lcp_len
+        logger.info(f"kv-marketplace: will copy ~{nbytes/1e6:.1f} MB for LCP={lcp_len}")
+        
         # Copy KV tensors from source to destination with coalescing
         # Use mapped local ordinals (src_dev_local, device_id) for correct P2P routing
         # Pass the stream directly - PeerCopy.copy_kv accepts int (CUDA stream pointer)
