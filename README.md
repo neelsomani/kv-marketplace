@@ -10,7 +10,9 @@ This design effectively transforms transformer inference into a cooperative cach
 
 ## Minimum Viable Prototype
 
-This initial release will focus on node-local reuse of transformer KV tensors within vLLM. The planned MVP includes:
+### Initial Release
+
+This initial release will focus on node-local reuse of transformer KV tensors within vLLM.
 
 * A development branch of vLLM with two integration hooks to:
   * import KV state before prefill when a matching prefix exists,
@@ -22,7 +24,7 @@ This initial release will focus on node-local reuse of transformer KV tensors wi
 * Tests confirming that reuse preserves next-token outputs within expected floating-point tolerance.
 * Example scripts demonstrating how to enable reuse and observe its effects.
 
-## Out of Scope for MVP
+### Out of Scope for MVP
 
 The MVP will not include:
 
@@ -35,6 +37,15 @@ The MVP will not include:
 * Longest Common Prefix (LCP) matching to enable partial reuse even when prompts differ slightly.
 
 Future iterations may expand into these areas after the node-local integration path is complete and validated.
+
+### vLLM fork required for cross-GPU KV import
+
+To try cross-GPU KV import with vLLM, you must use the companion fork and branch:
+
+- Repo: `neelsomani/vllm`
+- Branch: `vllm-kvm-dev`
+
+This fork adds two integration hooks (`before_prefill`, `after_prefill`) and a minimal plugin shim used by this project. Upstream vLLM will run, but it will not perform cross-GPU KV imports.
 
 ## Installation
 

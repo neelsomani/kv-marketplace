@@ -18,6 +18,7 @@ import os
 import time
 import argparse
 import logging
+import random
 from typing import List, Dict, Tuple, Any
 from collections import defaultdict
 from multiprocessing import Process, Queue
@@ -54,12 +55,14 @@ def maybe_get_adapter_funcs():
 def create_prefixes_from_system_prompt(system_prompt: str, num_prefixes: int = 10) -> List[str]:
     """Split system prompt into N different prefixes by splitting on '. '.
     
+    Creates prefixes with the same sentences but in scrambled order.
+    
     Args:
         system_prompt: The system prompt to split
         num_prefixes: Number of prefixes to create
         
     Returns:
-        List of prefixes (each is a cumulative prefix up to that sentence)
+        List of prefixes (each is a cumulative prefix with sentences in different order)
     """
     sentences = system_prompt.split('. ')
     
@@ -68,12 +71,18 @@ def create_prefixes_from_system_prompt(system_prompt: str, num_prefixes: int = 1
         num_prefixes = len(sentences)
     
     prefixes = []
-    current_prefix = ""
-    for i in range(num_prefixes):
-        if i == 0:
-            current_prefix = sentences[i]
-        else:
-            current_prefix = current_prefix + '. ' + sentences[i]
+    for _ in range(num_prefixes):
+        # Shuffle sentences for each prefix to create different orderings
+        shuffled_sentences = sentences.copy()
+        random.shuffle(shuffled_sentences)
+        
+        # Create cumulative prefix from shuffled order
+        current_prefix = ""
+        for i, sentence in enumerate(shuffled_sentences):
+            if i == 0:
+                current_prefix = sentence
+            else:
+                current_prefix = current_prefix + '. ' + sentence
         prefixes.append(current_prefix)
     
     return prefixes
@@ -169,11 +178,7 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
     # Set device mask BEFORE any CUDA/PyTorch initialization
     os.environ['CUDA_VISIBLE_DEVICES'] = device_mask
     
-    # If we exposed both GPUs, choose the second one explicitly before any torch/vllm use
-    # This allows Phase 2 to see both GPUs (for cross-GPU imports) while using GPU 1
-    if device_mask == "0,1":
-        import torch
-        torch.cuda.set_device(1)  # pin current context to the second visible device
+    # Do not force torch current device here; vLLM will pick device 0 of the visible list.
     
     # Force vLLM's internal workers to use spawn instead of fork
     # This must be set before any torch/vllm imports
@@ -262,6 +267,26 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
         
         # Initialize LLM (will now see only the specified GPU)
         llm = LLM(model=model, **shared_kwargs)
+        
+        # Print prefix caching configuration to verify it's enabled
+        print(f"[{phase_name}] cfg.enable_prefix_caching: {llm.llm_engine.cache_config.enable_prefix_caching}")
+    
+        # Sanity logs: print device IDs to verify correct GPU selection
+        import torch
+        if torch.cuda.is_available():
+            local_device_id = torch.cuda.current_device()
+            print(f"  [{phase_name}] Local device ordinal: {local_device_id}")
+            # Try to get stable device ID if adapter is available
+            if kvm_enabled:
+                try:
+                    from kv_marketplace.adapter.vllm import get_stable_device_id
+                    stable_id = get_stable_device_id(local_device_id)
+                    if stable_id:
+                        print(f"  [{phase_name}] Stable device ID: {stable_id}")
+                    else:
+                        print(f"  [{phase_name}] Stable device ID: None (unavailable)")
+                except Exception:
+                    pass  # Skip if adapter not available
         
         # Run batched generation
         lats, outs, _, wall = measure_latency_concurrent_local(llm, prompts, sampling_params, phase_name)
@@ -408,7 +433,6 @@ def run_benchmark(
     gpu_memory_utilization: float = 0.9,
     tensor_parallel_size: int = 1,
     max_model_len: int = 1024,
-    enable_prefix_caching: bool = False,
     **llm_kwargs
 ) -> Dict:
     """Run benchmark with or without kv-marketplace.
@@ -504,7 +528,7 @@ def run_benchmark(
         **({'kv_cache_memory_bytes': 36413060300} if kv_marketplace else {'gpu_memory_utilization': gpu_memory_utilization}),
         'tensor_parallel_size': 1,  # Force TP=1 for data parallelism
         'max_model_len': max_model_len,
-        'enable_prefix_caching': enable_prefix_caching,  # Disable by default for clean benchmark
+        'enable_prefix_caching': True,  # Always enable prefix caching
         'distributed_executor_backend': 'mp',  # Use multiprocessing instead of Ray
         # Note: worker_multiprocess_method is controlled via VLLM_WORKER_MULTIPROC_METHOD env var
         # (set in child_run before any torch/vllm imports)
@@ -585,13 +609,23 @@ def run_benchmark(
                   f"local_hits={phase1_stats['local_hits']}, "
                   f"cross_hits={phase1_stats['cross_hits']}")
         
+        # Reset stats before Phase 2 so Phase 2 stats only reflect Phase 2 activity
+        # (Registry/exports remain intact for Phase 2 to import from Phase 1)
+        if kv_marketplace and reset_stats_fn:
+            try:
+                reset_stats_fn()
+                print("Reset stats before Phase 2 (registry preserved)")
+            except Exception as e:
+                print(f"Warning: Failed to reset stats before Phase 2: {e}")
+        
         # Barrier
         time.sleep(0.5)
         
         # Phase 2: Process on GPU 1 (forces cross-GPU)
         # Make both GPUs visible so Phase 2 can import from GPU 0
-        print(f"\n--- Phase 2: Test ({len(phase2_prompts)} requests on GPU 1, scrambled prefixes) ---")
-        p2 = Process(target=child_run, args=("0,1", model, shared_kwargs, phase2_prompts, 
+        print(f"\n--- Phase 2: Test ({len(phase2_prompts)} requests on GPU 1) ---")
+        # Make GPU1 the first visible device so vLLM picks it, but keep GPU0 visible for P2P
+        p2 = Process(target=child_run, args=("1,0", model, shared_kwargs, phase2_prompts, 
                                              sampling_params_dict, q2, "Phase2"))
         p2.start()
         
@@ -667,6 +701,14 @@ def run_benchmark(
         total_registry_size = max(phase1_stats['registry_size'], phase2_stats['registry_size']) if kv_marketplace else 0
         total_prefix_index_size = max(phase1_stats['prefix_index_size'], phase2_stats['prefix_index_size']) if kv_marketplace else 0
         
+        # Calculate Phase 1 metrics
+        phase1_avg_latency = sum(phase1_latencies) / len(phase1_latencies) if phase1_latencies else 0
+        phase1_throughput = len(phase1_latencies) / phase1_total_time if phase1_total_time > 0 else 0
+        
+        # Calculate Phase 2 metrics
+        phase2_avg_latency = sum(phase2_latencies) / len(phase2_latencies) if phase2_latencies else 0
+        phase2_throughput = len(phase2_latencies) / phase2_total_time if phase2_total_time > 0 else 0
+        
         run_stat = {
             'run': run_idx + 1,
             'avg_latency': avg_latency,
@@ -679,6 +721,22 @@ def run_benchmark(
             'local_hits': local_hits,
             'cross_hits': cross_hits,
             'import_lcp_lengths': lcp_lengths,
+            # Phase 1 metrics
+            'phase1_avg_latency': phase1_avg_latency,
+            'phase1_total_time': phase1_total_time,
+            'phase1_throughput': phase1_throughput,
+            'phase1_local_hits': phase1_stats.get('local_hits', 0),
+            'phase1_cross_hits': phase1_stats.get('cross_hits', 0),
+            'phase1_import_hits': phase1_stats.get('import_hits', 0),
+            'phase1_import_misses': phase1_stats.get('import_misses', 0),
+            # Phase 2 metrics
+            'phase2_avg_latency': phase2_avg_latency,
+            'phase2_total_time': phase2_total_time,
+            'phase2_throughput': phase2_throughput,
+            'phase2_local_hits': phase2_stats.get('local_hits', 0),
+            'phase2_cross_hits': phase2_stats.get('cross_hits', 0),
+            'phase2_import_hits': phase2_stats.get('import_hits', 0),
+            'phase2_import_misses': phase2_stats.get('import_misses', 0),
         }
         run_stats.append(run_stat)
         
@@ -757,7 +815,34 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
         print("Cannot create comparison: missing results")
         return
     
-    metrics = [
+    # Calculate Phase 1 and Phase 2 averages from run_stats
+    run_stats_with = results_with.get('run_stats', [])
+    run_stats_without = results_without.get('run_stats', [])
+    
+    # Calculate Phase 1 combined metrics
+    phase1_metrics = [
+        ('Phase 1 Avg Latency', 'phase1_avg_latency', 's', lambda x: x),
+        ('Phase 1 Total Time', 'phase1_total_time', 's', lambda x: x),
+        ('Phase 1 Throughput', 'phase1_throughput', 'req/s', lambda x: x),
+        ('Phase 1 Cross Hits', 'phase1_cross_hits', '', lambda x: int(x)),
+        ('Phase 1 Local Hits', 'phase1_local_hits', '', lambda x: int(x)),
+        ('Phase 1 Import Hits', 'phase1_import_hits', '', lambda x: int(x)),
+        ('Phase 1 Import Misses', 'phase1_import_misses', '', lambda x: int(x)),
+    ]
+    
+    # Calculate Phase 2 combined metrics
+    phase2_metrics = [
+        ('Phase 2 Avg Latency', 'phase2_avg_latency', 's', lambda x: x),
+        ('Phase 2 Total Time', 'phase2_total_time', 's', lambda x: x),
+        ('Phase 2 Throughput', 'phase2_throughput', 'req/s', lambda x: x),
+        ('Phase 2 Cross Hits', 'phase2_cross_hits', '', lambda x: int(x)),
+        ('Phase 2 Local Hits', 'phase2_local_hits', '', lambda x: int(x)),
+        ('Phase 2 Import Hits', 'phase2_import_hits', '', lambda x: int(x)),
+        ('Phase 2 Import Misses', 'phase2_import_misses', '', lambda x: int(x)),
+    ]
+    
+    # Combined metrics (overall)
+    combined_metrics = [
         ('Average Latency', 'avg_latency', 's', lambda x: x),
         ('Total Latency', 'total_latency', 's', lambda x: x),
         ('Throughput', 'throughput', 'req/s', lambda x: x),
@@ -767,10 +852,75 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
         ('Registry Size', 'registry_size', '', lambda x: int(x)),
     ]
     
-    print(f"{'Metric':<20} {'Without kv-mkt':<20} {'With kv-mkt':<20} {'Improvement':<20}")
-    print("-" * 80)
+    def calc_avg_from_runs(run_stats, key):
+        """Calculate average value from run_stats."""
+        if not run_stats:
+            return 0
+        values = [r.get(key, 0) for r in run_stats if r.get(key, 0) > 0]
+        return sum(values) / len(values) if values else 0
     
-    for name, key, unit, formatter in metrics:
+    def calc_sum_from_runs(run_stats, key):
+        """Calculate sum value from run_stats."""
+        if not run_stats:
+            return 0
+        return sum(r.get(key, 0) for r in run_stats)
+    
+    print(f"{'Metric':<25} {'Without kv-mkt':<20} {'With kv-mkt':<20} {'Improvement':<20}")
+    print("-" * 85)
+    
+    # Print Phase 1 combined metrics
+    print("\n  PHASE 1 (Avg across runs):")
+    for name, key, unit, formatter in phase1_metrics:
+        without_val = calc_avg_from_runs(run_stats_without, key) if 'time' in key.lower() or 'latency' in key.lower() or 'throughput' in key.lower() else calc_sum_from_runs(run_stats_without, key)
+        with_val = calc_avg_from_runs(run_stats_with, key) if 'time' in key.lower() or 'latency' in key.lower() or 'throughput' in key.lower() else calc_sum_from_runs(run_stats_with, key)
+        
+        if without_val > 0:
+            if 'latency' in key.lower() or 'time' in key.lower():
+                # For latency, lower is better
+                improvement = ((without_val - with_val) / without_val) * 100
+                improvement_str = f"{improvement:+.1f}%"
+            elif 'throughput' in key.lower():
+                # For throughput, higher is better
+                improvement = ((with_val - without_val) / without_val) * 100
+                improvement_str = f"{improvement:+.1f}%"
+            else:
+                improvement_str = "N/A"
+        else:
+            improvement_str = "N/A"
+        
+        without_str = f"{formatter(without_val)}{unit}" if without_val > 0 else "N/A"
+        with_str = f"{formatter(with_val)}{unit}" if with_val > 0 else "N/A"
+        
+        print(f"  {name:<23} {without_str:<20} {with_str:<20} {improvement_str:<20}")
+    
+    # Print Phase 2 combined metrics
+    print("\n  PHASE 2 (Avg across runs):")
+    for name, key, unit, formatter in phase2_metrics:
+        without_val = calc_avg_from_runs(run_stats_without, key) if 'time' in key.lower() or 'latency' in key.lower() or 'throughput' in key.lower() else calc_sum_from_runs(run_stats_without, key)
+        with_val = calc_avg_from_runs(run_stats_with, key) if 'time' in key.lower() or 'latency' in key.lower() or 'throughput' in key.lower() else calc_sum_from_runs(run_stats_with, key)
+        
+        if without_val > 0:
+            if 'latency' in key.lower() or 'time' in key.lower():
+                # For latency, lower is better
+                improvement = ((without_val - with_val) / without_val) * 100
+                improvement_str = f"{improvement:+.1f}%"
+            elif 'throughput' in key.lower():
+                # For throughput, higher is better
+                improvement = ((with_val - without_val) / without_val) * 100
+                improvement_str = f"{improvement:+.1f}%"
+            else:
+                improvement_str = "N/A"
+        else:
+            improvement_str = "N/A"
+        
+        without_str = f"{formatter(without_val)}{unit}" if without_val > 0 else "N/A"
+        with_str = f"{formatter(with_val)}{unit}" if with_val > 0 else "N/A"
+        
+        print(f"  {name:<23} {without_str:<20} {with_str:<20} {improvement_str:<20}")
+    
+    # Print overall combined metrics
+    print("\n  OVERALL (Combined):")
+    for name, key, unit, formatter in combined_metrics:
         without_val = results_without.get(key, 0)
         with_val = results_with.get(key, 0)
         
@@ -791,7 +941,113 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
         without_str = f"{formatter(without_val)}{unit}" if without_val > 0 else "N/A"
         with_str = f"{formatter(with_val)}{unit}" if with_val > 0 else "N/A"
         
-        print(f"{name:<20} {without_str:<20} {with_str:<20} {improvement_str:<20}")
+        print(f"  {name:<23} {without_str:<20} {with_str:<20} {improvement_str:<20}")
+    
+    # Phase 1 metrics per run
+    print(f"\n{'='*80}")
+    print("  PHASE 1 METRICS (per run)")
+    print(f"{'='*80}\n")
+    
+    if run_stats_with and run_stats_without:
+        phase1_metrics = [
+            ('Avg Latency', 'phase1_avg_latency', 's', lambda x: x),
+            ('Total Time', 'phase1_total_time', 's', lambda x: x),
+            ('Throughput', 'phase1_throughput', 'req/s', lambda x: x),
+            ('Local Hits', 'phase1_local_hits', '', lambda x: int(x)),
+            ('Cross Hits', 'phase1_cross_hits', '', lambda x: int(x)),
+            ('Import Hits', 'phase1_import_hits', '', lambda x: int(x)),
+            ('Import Misses', 'phase1_import_misses', '', lambda x: int(x)),
+        ]
+        
+        # Find max number of runs
+        max_runs = max(len(run_stats_with), len(run_stats_without))
+        
+        print(f"{'Run':<6} {'Metric':<20} {'Without kv-mkt':<20} {'With kv-mkt':<20} {'Improvement':<20}")
+        print("-" * 80)
+        
+        for run_idx in range(max_runs):
+            run_with = run_stats_with[run_idx] if run_idx < len(run_stats_with) else {}
+            run_without = run_stats_without[run_idx] if run_idx < len(run_stats_without) else {}
+            
+            for name, key, unit, formatter in phase1_metrics:
+                without_val = run_without.get(key, 0)
+                with_val = run_with.get(key, 0)
+                
+                if without_val > 0:
+                    if key in ['phase1_avg_latency', 'phase1_total_time']:
+                        # For latency, lower is better
+                        improvement = ((without_val - with_val) / without_val) * 100
+                        improvement_str = f"{improvement:+.1f}%"
+                    elif key == 'phase1_throughput':
+                        # For throughput, higher is better
+                        improvement = ((with_val - without_val) / without_val) * 100
+                        improvement_str = f"{improvement:+.1f}%"
+                    else:
+                        improvement_str = "N/A"
+                else:
+                    improvement_str = "N/A"
+                
+                without_str = f"{formatter(without_val)}{unit}" if without_val > 0 else "N/A"
+                with_str = f"{formatter(with_val)}{unit}" if with_val > 0 else "N/A"
+                
+                run_label = f"Run {run_idx + 1}" if name == phase1_metrics[0][0] else ""
+                print(f"{run_label:<6} {name:<20} {without_str:<20} {with_str:<20} {improvement_str:<20}")
+            
+            if run_idx < max_runs - 1:
+                print("-" * 80)
+    
+    # Phase 2 metrics per run
+    print(f"\n{'='*80}")
+    print("  PHASE 2 METRICS (per run)")
+    print(f"{'='*80}\n")
+    
+    if run_stats_with and run_stats_without:
+        phase2_metrics = [
+            ('Avg Latency', 'phase2_avg_latency', 's', lambda x: x),
+            ('Total Time', 'phase2_total_time', 's', lambda x: x),
+            ('Throughput', 'phase2_throughput', 'req/s', lambda x: x),
+            ('Local Hits', 'phase2_local_hits', '', lambda x: int(x)),
+            ('Cross Hits', 'phase2_cross_hits', '', lambda x: int(x)),
+            ('Import Hits', 'phase2_import_hits', '', lambda x: int(x)),
+            ('Import Misses', 'phase2_import_misses', '', lambda x: int(x)),
+        ]
+        
+        # Find max number of runs
+        max_runs = max(len(run_stats_with), len(run_stats_without))
+        
+        print(f"{'Run':<6} {'Metric':<20} {'Without kv-mkt':<20} {'With kv-mkt':<20} {'Improvement':<20}")
+        print("-" * 80)
+        
+        for run_idx in range(max_runs):
+            run_with = run_stats_with[run_idx] if run_idx < len(run_stats_with) else {}
+            run_without = run_stats_without[run_idx] if run_idx < len(run_stats_without) else {}
+            
+            for name, key, unit, formatter in phase2_metrics:
+                without_val = run_without.get(key, 0)
+                with_val = run_with.get(key, 0)
+                
+                if without_val > 0:
+                    if key in ['phase2_avg_latency', 'phase2_total_time']:
+                        # For latency, lower is better
+                        improvement = ((without_val - with_val) / without_val) * 100
+                        improvement_str = f"{improvement:+.1f}%"
+                    elif key == 'phase2_throughput':
+                        # For throughput, higher is better
+                        improvement = ((with_val - without_val) / without_val) * 100
+                        improvement_str = f"{improvement:+.1f}%"
+                    else:
+                        improvement_str = "N/A"
+                else:
+                    improvement_str = "N/A"
+                
+                without_str = f"{formatter(without_val)}{unit}" if without_val > 0 else "N/A"
+                with_str = f"{formatter(with_val)}{unit}" if with_val > 0 else "N/A"
+                
+                run_label = f"Run {run_idx + 1}" if name == phase2_metrics[0][0] else ""
+                print(f"{run_label:<6} {name:<20} {without_str:<20} {with_str:<20} {improvement_str:<20}")
+            
+            if run_idx < max_runs - 1:
+                print("-" * 80)
     
     print("\n" + "="*80)
 
@@ -850,8 +1106,6 @@ Examples:
                        help='Tensor parallelism size (default: 1)')
     parser.add_argument('--max-model-len', type=int, default=1024,
                        help='Maximum model length (default: 1024)')
-    parser.add_argument('--enable-prefix-caching', action='store_true', default=False,
-                       help='Enable vLLM prefix caching (default: False, disabled for clean benchmark)')
     parser.add_argument('--compare', action='store_true',
                        help='Run comparison with and without kv-marketplace')
     parser.add_argument('--no-kv-marketplace', action='store_true',
@@ -860,6 +1114,8 @@ Examples:
                        help='Save benchmark results to JSON file (e.g., results.json)')
     parser.add_argument('--kv-marketplace-only', action='store_true',
                        help='Run only kv-marketplace version (skip baseline when using --compare)')
+    parser.add_argument('--print-registry-keys', action='store_true', default=False,
+                       help='Print registry keys at the end (default: False)')
     
     args = parser.parse_args()
     
@@ -965,23 +1221,24 @@ Examples:
             if args.save_results:
                 save_results_to_file(results, args.save_results)
     
-    # Print registry keys at the end if kv-marketplace is enabled
-    kv_marketplace_final = not args.no_kv_marketplace if not args.compare else True
-    if kv_marketplace_final:
-        get_stats_fn_final, _, _, get_registry_keys_fn_final = maybe_get_adapter_funcs()
-        if get_registry_keys_fn_final:
-            try:
-                registry_keys = get_registry_keys_fn_final()
-                print(f"\n{'='*80}")
-                print(f"  Registry Keys ({len(registry_keys)} total)")
-                print(f"{'='*80}")
-                if registry_keys:
-                    for i, (compat_checksum, prefix_hash) in enumerate(registry_keys, 1):
-                        print(f"  {i}. compat_checksum={compat_checksum.hex()[:16]}... prefix_hash={prefix_hash.hex()[:16]}...")
-                else:
-                    print("  (Registry is empty)")
-            except Exception as e:
-                print(f"\nWarning: Could not retrieve registry keys: {e}")
+    # Print registry keys at the end if requested and kv-marketplace is enabled
+    if args.print_registry_keys:
+        kv_marketplace_final = not args.no_kv_marketplace if not args.compare else True
+        if kv_marketplace_final:
+            get_stats_fn_final, _, _, get_registry_keys_fn_final = maybe_get_adapter_funcs()
+            if get_registry_keys_fn_final:
+                try:
+                    registry_keys = get_registry_keys_fn_final()
+                    print(f"\n{'='*80}")
+                    print(f"  Registry Keys ({len(registry_keys)} total)")
+                    print(f"{'='*80}")
+                    if registry_keys:
+                        for i, (compat_checksum, prefix_hash) in enumerate(registry_keys, 1):
+                            print(f"  {i}. compat_checksum={compat_checksum.hex()[:16]}... prefix_hash={prefix_hash.hex()[:16]}...")
+                    else:
+                        print("  (Registry is empty)")
+                except Exception as e:
+                    print(f"\nWarning: Could not retrieve registry keys: {e}")
     
     print("\n✓ Demo completed!")
 
