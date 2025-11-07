@@ -8,7 +8,7 @@ import mmap
 import os
 import struct
 import tempfile
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 try:  # pragma: no cover - platform specific import
     from multiprocessing import shared_memory
@@ -50,6 +50,9 @@ class SharedMemoryJSONStore:
         self._backend: str
         self._shm: Any = None
         self._mmap: Any = None
+        self._shm_created: bool = False
+        self._mmap_created: bool = False
+        self._mmap_path: Optional[str] = None
         self._buffer = self._attach_buffer()
         self._capacity = len(self._buffer) - _HEADER_STRUCT.size
 
@@ -99,6 +102,8 @@ class SharedMemoryJSONStore:
         if self._shm is not None:
             try:
                 self._shm.close()
+                if self._shm_created:
+                    self._shm.unlink()
             except Exception:
                 pass
         if self._mmap is not None:
@@ -106,6 +111,11 @@ class SharedMemoryJSONStore:
                 self._mmap.close()
             except Exception:
                 pass
+            if self._mmap_created and self._mmap_path:
+                try:
+                    os.remove(self._mmap_path)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -130,10 +140,12 @@ class SharedMemoryJSONStore:
                 )
                 buf = self._shm.buf
                 created = True
+                self._shm_created = True
                 self._backend = 'posix_shm'
             except FileExistsError:
                 self._shm = shared_memory.SharedMemory(name=shm_name, create=False)
                 buf = self._shm.buf
+                self._shm_created = False
                 self._backend = 'posix_shm'
             except PermissionError:
                 logger.warning(
@@ -165,6 +177,8 @@ class SharedMemoryJSONStore:
             os.close(fd)
 
         self._mmap = mm
+        self._mmap_path = path
+        self._mmap_created = created
         self._backend = 'mmap_file'
         return memoryview(mm), created
 

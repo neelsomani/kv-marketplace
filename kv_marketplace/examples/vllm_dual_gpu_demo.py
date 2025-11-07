@@ -509,6 +509,8 @@ def run_benchmark(
         os.environ.pop('KV_MARKETPLACE_FILE_BACKEND', None)
         os.environ.setdefault('KV_MARKETPLACE_SHM_BACKEND', '1')
         print(f"Detected {torch.cuda.device_count()} GPUs, shared-memory registry backend enabled for cross-process sharing")
+    else:
+        os.environ.pop('KV_MARKETPLACE_FILE_BACKEND', None)
     
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         print("ERROR: Need at least 2 GPUs for cross-GPU benchmark")
@@ -522,6 +524,7 @@ def run_benchmark(
     
     # Lazy import adapter functions only if kv-marketplace is enabled
     get_stats_fn, reset_stats_fn, clear_registry_fn, get_registry_keys_fn = None, None, None, None
+    shutdown_backends_fn = None
     if kv_marketplace:
         get_stats_fn, reset_stats_fn, clear_registry_fn, get_registry_keys_fn = maybe_get_adapter_funcs()
         if reset_stats_fn:
@@ -536,12 +539,18 @@ def run_benchmark(
                 print("Cleared registry and prefix index to ensure empty cache")
             except Exception as e:
                 print(f"Warning: Failed to clear registry: {e}")
+        try:
+            from kv_marketplace.adapter.vllm import shutdown_backends as _shutdown_backends
+            shutdown_backends_fn = _shutdown_backends
+        except Exception:
+            shutdown_backends_fn = None
+        os.environ.setdefault('KV_MARKETPLACE_HANDLE_CACHE_SIZE', 'inf')
     
     # Shared kwargs for both child processes
     shared_kwargs = {
         'kv_marketplace': kv_marketplace,
         'kv_min_prefix': kv_min_prefix,
-        **({'kv_cache_memory_bytes': 36413060300} if kv_marketplace else {'gpu_memory_utilization': gpu_memory_utilization}),
+        'gpu_memory_utilization': gpu_memory_utilization,
         'tensor_parallel_size': 1,  # Force TP=1 for data parallelism
         'max_model_len': max_model_len,
         'enable_prefix_caching': True,  # Always enable prefix caching
@@ -808,6 +817,12 @@ def run_benchmark(
         'all_latencies': all_latencies,
         'all_outputs': all_outputs,
     }
+
+    if kv_marketplace and shutdown_backends_fn:
+        try:
+            shutdown_backends_fn()
+        except Exception as exc:
+            print(f"Warning: Failed to shut down kv-marketplace backends cleanly: {exc}")
     
     return result
 

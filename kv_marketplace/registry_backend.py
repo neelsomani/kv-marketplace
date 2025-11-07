@@ -74,6 +74,10 @@ class RegistryBackend(ABC):
         """
         pass
 
+    def close(self) -> None:
+        """Release any resources held by the backend."""
+        return
+
 
 class InProcessRegistryBackend(RegistryBackend):
     """In-process, in-memory registry backend.
@@ -349,3 +353,6 @@ class SharedMemoryRegistryBackend(RegistryBackend):
             except ValueError:
                 continue
         return keys
+
+    def close(self) -> None:
+        self._store.close()

@@ -164,3 +164,6 @@ class SharedMemoryPrefixIndex(PrefixIndex):
         if inserted['added']:
             self._sequence_cache.add(seq_tuple)
         return result_hash
+
+    def close(self) -> None:
+        self._store.close()

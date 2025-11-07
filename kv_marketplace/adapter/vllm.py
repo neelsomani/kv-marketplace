@@ -42,6 +42,8 @@ def _env_int(name: str, default: int) -> int:
     if val is None:
         return default
     try:
+        if val.lower() in ('inf', 'infinity'):
+            return 1 << 60
         return int(val)
     except ValueError:
         return default
@@ -91,7 +93,7 @@ _import_lcp_lengths = []
 _local_hits = 0  # Cache hits on same GPU (skipped by marketplace)
 _cross_hits = 0  # Cross-GPU cache hits (marketplace imports)
 
-_HANDLE_CACHE_MAX = int(os.environ.get('KV_MARKETPLACE_HANDLE_CACHE_SIZE', '2048'))
+_HANDLE_CACHE_MAX = _env_int('KV_MARKETPLACE_HANDLE_CACHE_SIZE', 2048)
 _handle_cache: 'OrderedDict[Tuple[bytes, bytes], KVHandle]' = OrderedDict()
 _handle_cache_hits = 0
 _handle_cache_misses = 0
@@ -520,6 +522,22 @@ def get_registry_keys() -> List[Tuple[bytes, bytes]]:
     except Exception as e:
         logger.warning(f"Failed to get registry keys: {e}")
         return []
+
+
+def shutdown_backends() -> None:
+    """Release shared-memory/file handles held by registry/prefix backends."""
+    try:
+        registry_backend = getattr(_registry, "_backend", None)
+        if registry_backend and hasattr(registry_backend, "close"):
+            registry_backend.close()
+    except Exception as exc:
+        logger.warning(f"kv-marketplace: failed to close registry backend cleanly: {exc}")
+
+    try:
+        if hasattr(_prefix_index, "close"):
+            _prefix_index.close()
+    except Exception as exc:
+        logger.warning(f"kv-marketplace: failed to close prefix index backend cleanly: {exc}")
 
 
 class VLLMImportCtx(TypedDict, total=False):
