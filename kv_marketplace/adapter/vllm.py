@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import time
+import atexit
 from collections import OrderedDict
 from typing import Callable, Optional, Tuple, List, TypedDict
 import torch
@@ -107,6 +108,7 @@ else:
 # File-based stats sharing for multiprocessing
 _stats_file = None
 _stats_lock_file = None
+_stats_dirty = False
 
 
 def _handle_cache_key(compat: KVCompat, prefix_hash: bytes) -> Tuple[bytes, bytes]:
@@ -229,7 +231,7 @@ def _get_lock_file_path():
     return _stats_lock_file
 
 
-def _write_stats_to_file():
+def _write_stats_to_file(force: bool = False):
     """Write current stats to file for cross-process access.
     
     Each process writes its local stats. The file structure is:
@@ -241,6 +243,12 @@ def _write_stats_to_file():
         }
     }
     """
+    global _stats_dirty
+
+    if not force:
+        _stats_dirty = True
+        return
+
     start = time.perf_counter()
     try:
         import os as os_module
@@ -275,8 +283,18 @@ def _write_stats_to_file():
         os.replace(temp_file, stats_file)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         logger.info("kv-marketplace: stats write completed in %.3f ms (pid=%s)", elapsed_ms, pid)
+        _stats_dirty = False
     except Exception as e:
         logger.warning(f"Failed to write stats to file: {e}")
+        _stats_dirty = True
+
+
+def _flush_stats_if_needed():
+    if _stats_dirty:
+        _write_stats_to_file(force=True)
+
+
+atexit.register(_flush_stats_if_needed)
 
 
 def _read_stats_from_file_raw():
@@ -397,6 +415,7 @@ def get_stats() -> dict:
         - prefix_index_size: Maximum prefix index size across processes
     """
     global _import_hits, _import_misses, _import_lcp_lengths, _local_hits, _cross_hits
+    _flush_stats_if_needed()
     
     # Get in-process stats
     # For registry_size, use the backend's size() method (works for both in-process and file-based)
@@ -452,7 +471,7 @@ def reset_stats():
         if os.path.exists(stats_file):
             os.remove(stats_file)
         # Write empty stats
-        _write_stats_to_file()
+        _write_stats_to_file(force=True)
     except Exception as e:
         logger.warning(f"Failed to reset file stats: {e}")
 
@@ -508,7 +527,7 @@ def clear_registry():
         if os.path.exists(stats_file):
             os.remove(stats_file)
         # Write empty stats to ensure file exists
-        _write_stats_to_file()
+        _write_stats_to_file(force=True)
     except Exception as e:
         logger.warning(f"Failed to clear stats file: {e}")
 
