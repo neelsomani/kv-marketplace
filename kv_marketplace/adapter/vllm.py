@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import time
+from collections import OrderedDict
 from typing import Callable, Optional, Tuple, List, TypedDict
 import torch
 from .types import KVLayout, AllocatedKV
@@ -23,7 +24,15 @@ logger.setLevel(logging.INFO)
 
 # Detect if we should use file-based backend for multi-process sharing
 # Use environment variable to enable, or auto-detect based on data parallelism
-_USE_FILE_BACKEND = os.environ.get('KV_MARKETPLACE_FILE_BACKEND', '').lower() in ('1', 'true', 'yes')
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse boolean-ish environment variable."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.lower() in ('1', 'true', 'yes', 'on')
+
+
+_USE_FILE_BACKEND = _env_flag('KV_MARKETPLACE_FILE_BACKEND')
 
 # Global instances for registry and prefix index
 # Use file-based backend if enabled for multi-process sharing on same machine
@@ -45,9 +54,48 @@ _import_lcp_lengths = []
 _local_hits = 0  # Cache hits on same GPU (skipped by marketplace)
 _cross_hits = 0  # Cross-GPU cache hits (marketplace imports)
 
+_HANDLE_CACHE_MAX = int(os.environ.get('KV_MARKETPLACE_HANDLE_CACHE_SIZE', '2048'))
+_handle_cache: 'OrderedDict[Tuple[bytes, bytes], KVHandle]' = OrderedDict()
+_handle_cache_hits = 0
+_handle_cache_misses = 0
+
+_ASYNC_IMPORT_COPY = _env_flag('KV_MARKETPLACE_ASYNC_IMPORT', True)
+if _ASYNC_IMPORT_COPY:
+    logger.info("kv-marketplace: async import copy enabled (no host sync unless requested)")
+else:
+    logger.info("kv-marketplace: forcing stream sync after each import copy")
+
 # File-based stats sharing for multiprocessing
 _stats_file = None
 _stats_lock_file = None
+
+
+def _handle_cache_key(compat: KVCompat, prefix_hash: bytes) -> Tuple[bytes, bytes]:
+    return (compat.checksum, prefix_hash)
+
+
+def _get_cached_handle(key: Tuple[bytes, bytes]) -> Optional[KVHandle]:
+    if _HANDLE_CACHE_MAX <= 0:
+        return None
+    handle = _handle_cache.get(key)
+    if handle is not None:
+        _handle_cache.move_to_end(key)
+    return handle
+
+
+def _cache_handle(key: Tuple[bytes, bytes], handle: KVHandle):
+    if _HANDLE_CACHE_MAX <= 0:
+        return
+    _handle_cache[key] = handle
+    _handle_cache.move_to_end(key)
+    while len(_handle_cache) > _HANDLE_CACHE_MAX:
+        _handle_cache.popitem(last=False)
+
+
+def _invalidate_handle_cache(key: Tuple[bytes, bytes]):
+    if _HANDLE_CACHE_MAX <= 0:
+        return
+    _handle_cache.pop(key, None)
 
 
 def get_stable_device_id(local_device_id: int) -> Optional[str]:
@@ -175,6 +223,9 @@ def _write_stats_to_file():
             'cross_hits': _cross_hits,
             'registry_size': _registry.size(),
             'prefix_index_size': len(_prefix_index._hash_to_length),
+            'handle_cache_size': len(_handle_cache),
+            'handle_cache_hits': _handle_cache_hits,
+            'handle_cache_misses': _handle_cache_misses,
         }
         
         # Atomic write: write to temp then rename
@@ -218,6 +269,9 @@ def _read_stats_from_file():
                 'import_lcp_lengths': [],
                 'registry_size': 0,
                 'prefix_index_size': 0,
+                'handle_cache_size': 0,
+                'handle_cache_hits': 0,
+                'handle_cache_misses': 0,
             }
         
         # Aggregate stats from all processes
@@ -228,6 +282,9 @@ def _read_stats_from_file():
         all_lcp_lengths = []
         max_registry_size = 0
         max_prefix_index_size = 0
+        total_handle_cache_hits = 0
+        total_handle_cache_misses = 0
+        max_handle_cache_size = 0
         
         for pid, proc_stats in processes.items():
             total_hits += proc_stats.get('import_hits', 0)
@@ -237,6 +294,9 @@ def _read_stats_from_file():
             all_lcp_lengths.extend(proc_stats.get('import_lcp_lengths', []))
             max_registry_size = max(max_registry_size, proc_stats.get('registry_size', 0))
             max_prefix_index_size = max(max_prefix_index_size, proc_stats.get('prefix_index_size', 0))
+            total_handle_cache_hits += proc_stats.get('handle_cache_hits', 0)
+            total_handle_cache_misses += proc_stats.get('handle_cache_misses', 0)
+            max_handle_cache_size = max(max_handle_cache_size, proc_stats.get('handle_cache_size', 0))
         
         return {
             'import_hits': total_hits,
@@ -246,6 +306,9 @@ def _read_stats_from_file():
             'import_lcp_lengths': all_lcp_lengths,
             'registry_size': max_registry_size,
             'prefix_index_size': max_prefix_index_size,
+            'handle_cache_size': max_handle_cache_size,
+            'handle_cache_hits': total_handle_cache_hits,
+            'handle_cache_misses': total_handle_cache_misses,
         }
     except Exception as e:
         logger.warning(f"Failed to aggregate stats from file: {e}")
@@ -431,6 +494,7 @@ class VLLMImportCtx(TypedDict, total=False):
     layout: KVLayout
     stream: int  # cudaStream_t as int
     allow_pcie: bool  # Optional: allow import even without peer access (via PCIe)
+    force_sync_copy: bool  # Optional: force host sync after copy
 
 
 class VLLMExportCtx(TypedDict):
@@ -470,6 +534,7 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         Tuple of (lcp_len, dst_alloc) if import succeeds, None otherwise
     """
     global _import_misses, _import_hits, _local_hits, _cross_hits
+    global _handle_cache_hits, _handle_cache_misses
     timings = {}
     total_start = time.perf_counter()
     
@@ -516,16 +581,29 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             _write_stats_to_file()
             return None
         
-        # Lookup handle in registry
-        # logger.debug(f"kv-marketplace before_prefill: Looking up handle in registry (size={_registry.size()}, compat_hash={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...)")
-        t = time.perf_counter()
-        handle = _registry.lookup(compat, prefix_hash)
-        timings['registry_lookup_ms'] = (time.perf_counter() - t) * 1000.0
+        cache_key = _handle_cache_key(compat, prefix_hash)
+        cache_enabled = _HANDLE_CACHE_MAX > 0
+        handle = None
+        if cache_enabled:
+            handle = _get_cached_handle(cache_key)
+            if handle is not None:
+                _handle_cache_hits += 1
+                timings['registry_lookup_ms'] = 0.0
+            else:
+                _handle_cache_misses += 1
         if handle is None:
-            logger.debug(f"kv-marketplace before_prefill: No handle found in registry for compat/prefix_hash")
-            _import_misses += 1
-            _write_stats_to_file()
-            return None
+            # Lookup handle in registry
+            # logger.debug(f"kv-marketplace before_prefill: Looking up handle in registry (size={_registry.size()}, compat_hash={compat.checksum.hex()[:8]}..., prefix_hash={prefix_hash.hex()[:8]}...)")
+            t = time.perf_counter()
+            handle = _registry.lookup(compat, prefix_hash)
+            timings['registry_lookup_ms'] = (time.perf_counter() - t) * 1000.0
+            if handle is None:
+                logger.debug(f"kv-marketplace before_prefill: No handle found in registry for compat/prefix_hash")
+                _import_misses += 1
+                _write_stats_to_file()
+                return None
+            if cache_enabled:
+                _cache_handle(cache_key, handle)
         
         # Use handle's layout_meta (authoritative) for the copy, with fallback to layout
         meta = handle.layout_meta or {
@@ -591,9 +669,10 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
                 f"Handle type: {type(handle)}, handle attributes: {dir(handle)}"
             )
             try:
-                _registry.delete(compat, prefix_hash)
+                _registry.remove(compat, prefix_hash)
             except Exception:
                 pass
+            _invalidate_handle_cache(cache_key)
             _import_misses += 1
             _write_stats_to_file()
             return None
@@ -604,9 +683,10 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
                 f"Handle type: {type(handle)}, handle attributes: {dir(handle)}"
             )
             try:
-                _registry.delete(compat, prefix_hash)
+                _registry.remove(compat, prefix_hash)
             except Exception:
                 pass
+            _invalidate_handle_cache(cache_key)
             _import_misses += 1
             _write_stats_to_file()
             return None
@@ -623,9 +703,10 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
                 f"v_ptrs={handle_v_ptrs[:5] if len(handle_v_ptrs) > 0 else []}); dropping handle"
             )
             try:
-                _registry.delete(compat, prefix_hash)
+                _registry.remove(compat, prefix_hash)
             except Exception:
                 pass
+            _invalidate_handle_cache(cache_key)
             _import_misses += 1
             _write_stats_to_file()
             return None
@@ -763,12 +844,15 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         )
         timings['copy_kv_ms'] = (time.perf_counter() - copy_start) * 1000.0
         
-        # Synchronize copy completion before suffix prefill (MVP requirement)
-        # This ensures the imported KV cache is fully materialized before vLLM continues
-        sync_start = time.perf_counter()
-        PeerCopy.synchronize_stream(ctx['stream'])
-        timings['sync_stream_ms'] = (time.perf_counter() - sync_start) * 1000.0
-        
+        # Synchronize copy completion before suffix prefill only if requested.
+        # By default we rely on stream ordering so prefill launches after the copy.
+        if (not _ASYNC_IMPORT_COPY) or ctx.get('force_sync_copy', False):
+            sync_start = time.perf_counter()
+            PeerCopy.synchronize_stream(ctx['stream'])
+            timings['sync_stream_ms'] = (time.perf_counter() - sync_start) * 1000.0
+        else:
+            timings['sync_stream_ms'] = 0.0
+
         total_duration_ms = (time.perf_counter() - total_start) * 1000.0
         logger.info(
             "kv-marketplace timings: find_lcp=%.2f ms registry=%.2f ms alloc=%.2f ms copy=%.2f ms sync=%.2f ms total=%.2f ms",
@@ -869,6 +953,7 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         
         # Compute prefix hash and insert into prefix index
         prefix_hash = _prefix_index.insert(prefix_tokens)
+        cache_key = _handle_cache_key(compat, prefix_hash)
         
         # Get stable globally unique device identifier (PCI bus ID or UUID)
         # This ensures correct device identification even when CUDA_VISIBLE_DEVICES
@@ -906,6 +991,7 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         
         # Register in registry
         _registry.register(compat, prefix_hash, handle)
+        _cache_handle(cache_key, handle)
         
         # Update file stats (registry size changed)
         _write_stats_to_file()
