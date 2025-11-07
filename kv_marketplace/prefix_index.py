@@ -39,27 +39,26 @@ class PrefixIndex:
         Returns:
             The hash of the token sequence
         """
-        if prefix_hash is None:
-            prefix_hash = self._hash_sequence(tokens)
-        
-        # Insert into trie, marking all prefix nodes
+        # Insert into trie, marking all prefix nodes while reusing a rolling hash
         node = self._root
-        depth = 0
-        for token in tokens:
+        hasher = xxhash.xxh3_64()
+        computed_hash: Optional[bytes] = None
+        
+        for depth, token in enumerate(tokens, start=1):
             if token not in node.children:
                 node.children[token] = TrieNode()
             node = node.children[token]
-            depth += 1
             
-            # Mark this prefix node with its hash
-            # This allows finding partial prefix matches
-            prefix = tokens[:depth]
-            prefix_hash_at_depth = self._hash_sequence(prefix)
+            hasher.update(token.to_bytes(8, byteorder='big'))
+            prefix_hash_at_depth = hasher.digest()
+            computed_hash = prefix_hash_at_depth
+            
             node.prefix_hash = prefix_hash_at_depth
             node.length = depth
             self._hash_to_length[prefix_hash_at_depth] = depth
         
-        return prefix_hash
+        # If the caller provided a hash for the full sequence, preserve it.
+        return prefix_hash if prefix_hash is not None else (computed_hash or self._hash_sequence(tokens))
     
     def find_lcp(self, query_tokens: List[int]) -> Optional[Tuple[int, bytes]]:
         """Find the longest common prefix match using trie traversal.
@@ -78,7 +77,7 @@ class PrefixIndex:
         best_hash = None
         
         # Traverse trie following query_tokens
-        for i, token in enumerate(query_tokens):
+        for token in query_tokens:
             if token not in node.children:
                 break
             
@@ -86,12 +85,8 @@ class PrefixIndex:
             
             # If this node marks the end of a stored prefix, update best match
             if node.prefix_hash is not None:
-                # Verify the hash matches (rolling hash verification)
-                prefix = query_tokens[:i + 1]
-                expected_hash = self._hash_sequence(prefix)
-                if expected_hash == node.prefix_hash:
-                    best_lcp = i + 1
-                    best_hash = node.prefix_hash
+                best_lcp = node.length
+                best_hash = node.prefix_hash
         
         if best_lcp > 0 and best_hash is not None:
             return (best_lcp, best_hash)
