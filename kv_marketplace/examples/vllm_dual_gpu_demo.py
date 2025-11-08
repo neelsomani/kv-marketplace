@@ -778,16 +778,24 @@ def run_benchmark(
         avg_latency = sum(latencies) / len(latencies)
         total_time = phase1_total_time + phase2_total_time  # Sum of wall-clock times
         throughput = len(latencies) / total_time if total_time > 0 else 0
-        trimmed_latencies = latencies[1:]
-        trimmed_total_time = max(total_time - (latencies[0] if latencies else 0.0), 0.0)
+
+        # Steady-state view: keep all Phase 1 requests, drop the first Phase 2 request.
+        drop_first_phase2 = len(phase2_latencies) > 0
+        if drop_first_phase2:
+            trimmed_latencies = phase1_latencies + phase2_latencies[1:]
+            trimmed_total_time = max(total_time - phase2_latencies[0], 0.0)
+        else:
+            trimmed_latencies = latencies
+            trimmed_total_time = total_time
+        trimmed_request_count = len(trimmed_latencies)
         trimmed_avg_latency = (
-            sum(trimmed_latencies) / len(trimmed_latencies)
-            if trimmed_latencies
+            sum(trimmed_latencies) / trimmed_request_count
+            if trimmed_request_count > 0
             else avg_latency
         )
         trimmed_throughput = (
-            len(trimmed_latencies) / trimmed_total_time
-            if trimmed_latencies and trimmed_total_time > 0
+            trimmed_request_count / trimmed_total_time
+            if trimmed_total_time > 0
             else 0.0
         )
         
@@ -798,21 +806,6 @@ def run_benchmark(
         cross_hits = phase1_stats['cross_hits'] + phase2_stats['cross_hits']
         lcp_lengths = phase1_stats['lcp_lengths'] + phase2_stats['lcp_lengths']
         avg_lcp = sum(lcp_lengths) / len(lcp_lengths) if lcp_lengths else 0
-        
-        if kv_marketplace:
-            # Use combined stats from both phases
-            total_registry_size = max(phase1_stats['registry_size'], phase2_stats['registry_size'])
-            total_prefix_index_size = max(phase1_stats['prefix_index_size'], phase2_stats['prefix_index_size'])
-            print(f"  Combined stats: registry_size={total_registry_size}, "
-                  f"prefix_index_size={total_prefix_index_size}, "
-                  f"total_import_hits={import_hits}, "
-                  f"total_import_misses={import_misses}, "
-                  f"local_hits={local_hits}, "
-                  f"cross_hits={cross_hits}")
-            if not prefetch_phase2:
-                print(f"  Run stats: local_hits={local_hits}, cross_hits={cross_hits} (cross_hits should be > 0 for benefit)")
-            else:
-                print(f"  Run stats: local_hits={local_hits}, cross_hits={cross_hits}")
         
         # Calculate total_registry_size and total_prefix_index_size for run_stat
         total_registry_size = max(phase1_stats['registry_size'], phase2_stats['registry_size']) if kv_marketplace else 0
@@ -855,17 +848,17 @@ def run_benchmark(
             'phase2_import_hits': phase2_stats.get('import_hits', 0),
             'phase2_import_misses': phase2_stats.get('import_misses', 0),
             'avg_latency_ex_first': trimmed_avg_latency,
-            'total_latency_ex_first': trimmed_total_time if trimmed_latencies else total_time,
-            'throughput_ex_first': trimmed_throughput if trimmed_latencies else throughput,
+            'total_latency_ex_first': trimmed_total_time,
+            'throughput_ex_first': trimmed_throughput if trimmed_request_count > 0 else throughput,
             'num_requests': len(latencies),
-            'num_requests_ex_first': len(trimmed_latencies),
+            'num_requests_ex_first': trimmed_request_count,
         }
         run_stats.append(run_stat)
         
         print(f"  Average latency: {avg_latency:.4f}s")
         print(f"  Total time: {total_time:.4f}s")
         print(f"  Throughput: {throughput:.2f} req/s")
-        if trimmed_latencies:
+        if drop_first_phase2 and trimmed_request_count > 0:
             print(
                 f"    (excluding first request) avg latency: {trimmed_avg_latency:.4f}s, "
                 f"throughput: {trimmed_throughput:.2f} req/s"
@@ -887,15 +880,21 @@ def run_benchmark(
     # Sum up the batched wall-clock times from each run
     overall_total_time = sum(run_stat['total_latency'] for run_stat in run_stats)
     overall_throughput = len(phase1_prompts + phase2_prompts) * num_runs / overall_total_time if overall_total_time > 0 else 0
-    trimmed_all_latencies = all_latencies[1:]
-    trimmed_request_count = sum(r.get('num_requests_ex_first', 0) for r in run_stats)
+    trimmed_request_count = sum(
+        r.get('num_requests_ex_first', r.get('num_requests', 0)) for r in run_stats
+    )
+    total_trimmed_latency = sum(
+        r.get('avg_latency_ex_first', r.get('avg_latency', 0.0))
+        * r.get('num_requests_ex_first', r.get('num_requests', 0))
+        for r in run_stats
+    )
     overall_avg_latency_ex_first = (
-        sum(trimmed_all_latencies) / len(trimmed_all_latencies)
-        if trimmed_all_latencies
+        total_trimmed_latency / trimmed_request_count
+        if trimmed_request_count > 0
         else overall_avg_latency
     )
     overall_total_time_ex_first = sum(
-        r.get('total_latency_ex_first', r['total_latency']) for r in run_stats
+        r.get('total_latency_ex_first', r.get('total_latency', 0.0)) for r in run_stats
     )
     overall_throughput_ex_first = (
         trimmed_request_count / overall_total_time_ex_first
@@ -936,7 +935,7 @@ def run_benchmark(
         'all_outputs': all_outputs,
     }
 
-    if trimmed_all_latencies:
+    if trimmed_request_count > 0:
         print(
             f"\nOverall avg latency (excluding first request): {overall_avg_latency_ex_first:.4f}s"
         )
@@ -1001,17 +1000,6 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
         ('Phase 2 Import Misses', 'phase2_import_misses', '', lambda x: int(x)),
     ]
     
-    # Combined metrics (overall)
-    combined_metrics = [
-        ('Average Latency', 'avg_latency', 's', lambda x: x),
-        ('Total Latency', 'total_latency', 's', lambda x: x),
-        ('Throughput', 'throughput', 'req/s', lambda x: x),
-        ('Cross-GPU Hits', 'cross_hits', '', lambda x: int(x)),
-        ('Local Hits', 'local_hits', '', lambda x: int(x)),
-        ('Avg LCP Length', 'avg_lcp_length', 'tokens', lambda x: x),
-        ('Registry Size', 'registry_size', '', lambda x: int(x)),
-    ]
-    
     def calc_avg_from_runs(run_stats, key):
         """Calculate average value from run_stats."""
         if not run_stats:
@@ -1065,31 +1053,6 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
                 improvement = ((without_val - with_val) / without_val) * 100
                 improvement_str = f"{improvement:+.1f}%"
             elif 'throughput' in key.lower():
-                # For throughput, higher is better
-                improvement = ((with_val - without_val) / without_val) * 100
-                improvement_str = f"{improvement:+.1f}%"
-            else:
-                improvement_str = "N/A"
-        else:
-            improvement_str = "N/A"
-        
-        without_str = f"{formatter(without_val)}{unit}" if without_val > 0 else "N/A"
-        with_str = f"{formatter(with_val)}{unit}" if with_val > 0 else "N/A"
-        
-        print(f"  {name:<23} {without_str:<20} {with_str:<20} {improvement_str:<20}")
-    
-    # Print overall combined metrics
-    print("\n  OVERALL (Combined):")
-    for name, key, unit, formatter in combined_metrics:
-        without_val = results_without.get(key, 0)
-        with_val = results_with.get(key, 0)
-        
-        if without_val > 0:
-            if key in ['avg_latency', 'total_latency']:
-                # For latency, lower is better
-                improvement = ((without_val - with_val) / without_val) * 100
-                improvement_str = f"{improvement:+.1f}%"
-            elif key == 'throughput':
                 # For throughput, higher is better
                 improvement = ((with_val - without_val) / without_val) * 100
                 improvement_str = f"{improvement:+.1f}%"
