@@ -760,8 +760,7 @@ def run_benchmark(
         print(f"Phase 2 average latency: {sum(phase2_latencies) / len(phase2_latencies):.4f}s per request")
         if kv_marketplace:
             print(f"Phase 2 stats: registry_size={phase2_stats['registry_size']}, "
-                  f"local_hits={phase2_stats['local_hits']}, "
-                  f"cross_hits={phase2_stats['cross_hits']}")
+                  f"prefix_index_size={phase2_stats['prefix_index_size']}")
         
         # Combine results
         latencies = phase1_latencies + phase2_latencies
@@ -832,9 +831,6 @@ def run_benchmark(
         if kv_marketplace:
             print(f"  Registry size: {total_registry_size}")
             print(f"  Prefix index size: {total_prefix_index_size}")
-        if kv_marketplace:
-            print(f"  Import hits: {import_hits} (local={local_hits}, cross={cross_hits})")
-            print(f"  Import misses: {import_misses}")
             if avg_lcp > 0:
                 print(f"  Average LCP length: {avg_lcp:.1f} tokens")
             if cross_hits == 0 and not prefetch_phase2:
@@ -915,10 +911,6 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
         ('Phase 1 Avg Latency', 'phase1_avg_latency', 's', lambda x: x),
         ('Phase 1 Total Time', 'phase1_total_time', 's', lambda x: x),
         ('Phase 1 Throughput', 'phase1_throughput', 'req/s', lambda x: x),
-        ('Phase 1 Cross Hits', 'phase1_cross_hits', '', lambda x: int(x)),
-        ('Phase 1 Local Hits', 'phase1_local_hits', '', lambda x: int(x)),
-        ('Phase 1 Import Hits', 'phase1_import_hits', '', lambda x: int(x)),
-        ('Phase 1 Import Misses', 'phase1_import_misses', '', lambda x: int(x)),
     ]
     
     # Calculate Phase 2 combined metrics
@@ -926,10 +918,6 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
         ('Phase 2 Avg Latency', 'phase2_avg_latency', 's', lambda x: x),
         ('Phase 2 Total Time', 'phase2_total_time', 's', lambda x: x),
         ('Phase 2 Throughput', 'phase2_throughput', 'req/s', lambda x: x),
-        ('Phase 2 Cross Hits', 'phase2_cross_hits', '', lambda x: int(x)),
-        ('Phase 2 Local Hits', 'phase2_local_hits', '', lambda x: int(x)),
-        ('Phase 2 Import Hits', 'phase2_import_hits', '', lambda x: int(x)),
-        ('Phase 2 Import Misses', 'phase2_import_misses', '', lambda x: int(x)),
     ]
     
     def calc_avg_from_runs(run_stats, key):
@@ -939,20 +927,14 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
         values = [r.get(key, 0) for r in run_stats if r.get(key, 0) > 0]
         return sum(values) / len(values) if values else 0
     
-    def calc_sum_from_runs(run_stats, key):
-        """Calculate sum value from run_stats."""
-        if not run_stats:
-            return 0
-        return sum(r.get(key, 0) for r in run_stats)
-    
     print(f"{'Metric':<25} {'Without kv-mkt':<20} {'With kv-mkt':<20} {'Improvement':<20}")
     print("-" * 85)
     
     # Print Phase 1 combined metrics
     print("\n  PHASE 1 (Avg across runs):")
     for name, key, unit, formatter in phase1_metrics:
-        without_val = calc_avg_from_runs(run_stats_without, key) if 'time' in key.lower() or 'latency' in key.lower() or 'throughput' in key.lower() else calc_sum_from_runs(run_stats_without, key)
-        with_val = calc_avg_from_runs(run_stats_with, key) if 'time' in key.lower() or 'latency' in key.lower() or 'throughput' in key.lower() else calc_sum_from_runs(run_stats_with, key)
+        without_val = calc_avg_from_runs(run_stats_without, key)
+        with_val = calc_avg_from_runs(run_stats_with, key)
         
         if without_val > 0:
             if 'latency' in key.lower() or 'time' in key.lower():
@@ -976,8 +958,8 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
     # Print Phase 2 combined metrics
     print("\n  PHASE 2 (Avg across runs):")
     for name, key, unit, formatter in phase2_metrics:
-        without_val = calc_avg_from_runs(run_stats_without, key) if 'time' in key.lower() or 'latency' in key.lower() or 'throughput' in key.lower() else calc_sum_from_runs(run_stats_without, key)
-        with_val = calc_avg_from_runs(run_stats_with, key) if 'time' in key.lower() or 'latency' in key.lower() or 'throughput' in key.lower() else calc_sum_from_runs(run_stats_with, key)
+        without_val = calc_avg_from_runs(run_stats_without, key)
+        with_val = calc_avg_from_runs(run_stats_with, key)
         
         if without_val > 0:
             if 'latency' in key.lower() or 'time' in key.lower():
@@ -1008,10 +990,6 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
             ('Avg Latency', 'phase1_avg_latency', 's', lambda x: x),
             ('Total Time', 'phase1_total_time', 's', lambda x: x),
             ('Throughput', 'phase1_throughput', 'req/s', lambda x: x),
-            ('Local Hits', 'phase1_local_hits', '', lambda x: int(x)),
-            ('Cross Hits', 'phase1_cross_hits', '', lambda x: int(x)),
-            ('Import Hits', 'phase1_import_hits', '', lambda x: int(x)),
-            ('Import Misses', 'phase1_import_misses', '', lambda x: int(x)),
         ]
         
         # Find max number of runs
@@ -1061,10 +1039,6 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
             ('Avg Latency', 'phase2_avg_latency', 's', lambda x: x),
             ('Total Time', 'phase2_total_time', 's', lambda x: x),
             ('Throughput', 'phase2_throughput', 'req/s', lambda x: x),
-            ('Local Hits', 'phase2_local_hits', '', lambda x: int(x)),
-            ('Cross Hits', 'phase2_cross_hits', '', lambda x: int(x)),
-            ('Import Hits', 'phase2_import_hits', '', lambda x: int(x)),
-            ('Import Misses', 'phase2_import_misses', '', lambda x: int(x)),
         ]
         
         # Find max number of runs
