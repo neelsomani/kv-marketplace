@@ -503,7 +503,7 @@ def run_benchmark(
     kv_min_prefix: int = 64,
     gpu_memory_utilization: float = 0.9,
     tensor_parallel_size: int = 1,
-    max_model_len: int = 1024,
+    max_model_len: int = 4096,
     prefetch_phase2: bool = True,
     **llm_kwargs
 ) -> Dict:
@@ -1256,8 +1256,8 @@ Examples:
                        help='GPU memory utilization (default: 0.9)')
     parser.add_argument('--tensor-parallel-size', type=int, default=1,
                        help='Tensor parallelism size (default: 1)')
-    parser.add_argument('--max-model-len', type=int, default=1024,
-                       help='Maximum model length (default: 1024)')
+    parser.add_argument('--max-model-len', type=int, default=4096,
+                       help='Maximum model length (default: 4096)')
     parser.add_argument('--compare', action='store_true',
                        help='Run comparison with and without kv-marketplace')
     parser.add_argument('--no-kv-marketplace', action='store_true',
