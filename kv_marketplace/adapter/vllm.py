@@ -807,12 +807,47 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         serve_with_local_copy = is_same_gpu
         if serve_with_local_copy:
             logger.info(
-                "kv-marketplace: Cache hit on same GPU %s (global_id=%s, lcp_len=%s), "
-                "performing local reuse copy instead of skipping import",
+                "kv-marketplace: Cache hit on same GPU %s (global_id=%s, lcp_len=%s)",
                 device_id,
                 current_global_id,
                 lcp_len,
             )
+
+        if serve_with_local_copy:
+            page_ranges = None
+            meta_ranges = meta.get('page_ranges')
+            if isinstance(meta_ranges, list):
+                page_ranges = []
+                for layer_range in meta_ranges:
+                    if isinstance(layer_range, list):
+                        page_ranges.append([tuple(pair) for pair in layer_range])
+                    else:
+                        page_ranges.append(layer_range)
+            if page_ranges:
+                logger.info(
+                    "kv-marketplace: Local reuse hit found on GPU %s (global_id=%s); "
+                    "reusing native prefix cache without copy",
+                    device_id,
+                    current_global_id,
+                )
+                dst_alloc = {
+                    'length': lcp_len,
+                    'page_ranges': page_ranges,
+                    'reuse_page_ranges': True,
+                }
+                total_duration_ms = (time.perf_counter() - total_start) * 1000.0
+                logger.info(
+                    "kv-marketplace timings: find_lcp=%.2f ms registry=%.2f ms alloc=0.00 ms "
+                    "copy=0.00 ms sync=0.00 ms total=%.2f ms (alias)",
+                    timings.get('find_lcp_ms', 0.0),
+                    timings.get('registry_lookup_ms', 0.0),
+                    total_duration_ms,
+                )
+                _import_hits += 1
+                _local_hits += 1
+                _import_lcp_lengths.append(lcp_len)
+                _write_stats_to_file()
+                return (lcp_len, dst_alloc)
 
         # Allocate destination KV cache only if we really need to import.
         alloc_start = time.perf_counter()
@@ -1026,7 +1061,6 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
         logger.info(f"kv-marketplace: Successfully imported {lcp_len} tokens from GPU {src_dev_local} to GPU {device_id} (coalesced segments, synchronized)")
         
         # Track successful import
-        global _import_hits, _import_lcp_lengths, _cross_hits, _local_hits
         _import_hits += 1
         if serve_with_local_copy:
             _local_hits += 1

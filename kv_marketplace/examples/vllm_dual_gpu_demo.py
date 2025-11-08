@@ -1066,6 +1066,35 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
         
         print(f"  {name:<23} {without_str:<20} {with_str:<20} {improvement_str:<20}")
     
+    # Steady-state overall metrics (excluding first Phase 2 request)
+    steady_metrics = [
+        ('Avg Latency (ex first)', 'avg_latency_ex_first', 's', lambda x: x),
+        ('Total Latency (ex first)', 'total_latency_ex_first', 's', lambda x: x),
+        ('Throughput (ex first)', 'throughput_ex_first', 'req/s', lambda x: x),
+    ]
+    
+    print("\n  STEADY-STATE (excluding first Phase 2 request):")
+    for name, key, unit, formatter in steady_metrics:
+        without_val = results_without.get(key, 0)
+        with_val = results_with.get(key, 0)
+        
+        if without_val > 0:
+            if 'latency' in key.lower() or 'total' in key.lower():
+                improvement = ((without_val - with_val) / without_val) * 100
+                improvement_str = f"{improvement:+.1f}%"
+            elif 'throughput' in key.lower():
+                improvement = ((with_val - without_val) / without_val) * 100
+                improvement_str = f"{improvement:+.1f}%"
+            else:
+                improvement_str = "N/A"
+        else:
+            improvement_str = "N/A"
+        
+        without_str = f"{formatter(without_val)}{unit}" if without_val > 0 else "N/A"
+        with_str = f"{formatter(with_val)}{unit}" if with_val > 0 else "N/A"
+        
+        print(f"  {name:<23} {without_str:<20} {with_str:<20} {improvement_str:<20}")
+    
     # Phase 1 metrics per run
     print(f"\n{'='*80}")
     print("  PHASE 1 METRICS (per run)")
