@@ -473,13 +473,8 @@ def print_stats_table(results: List[Dict], title: str):
     # Calculate averages
     avg_latency = sum(r['avg_latency'] for r in results) / len(results)
     avg_throughput = sum(r.get('throughput', 0) for r in results) / len(results) if any('throughput' in r for r in results) else 0
-    avg_latency_ex_first = (
-        sum(r.get('avg_latency_ex_first', r['avg_latency']) for r in results) / len(results)
-    )
 
     print(f"\nAverage Latency: {avg_latency:.4f}s")
-    if avg_latency_ex_first and avg_latency_ex_first != avg_latency:
-        print(f"Average Latency (excl. first request): {avg_latency_ex_first:.4f}s")
     if avg_throughput > 0:
         print(f"Average Throughput: {avg_throughput:.2f} req/s")
     
@@ -779,26 +774,6 @@ def run_benchmark(
         total_time = phase1_total_time + phase2_total_time  # Sum of wall-clock times
         throughput = len(latencies) / total_time if total_time > 0 else 0
 
-        # Steady-state view: keep all Phase 1 requests, drop the first Phase 2 request.
-        drop_first_phase2 = len(phase2_latencies) > 0
-        if drop_first_phase2:
-            trimmed_latencies = phase1_latencies + phase2_latencies[1:]
-            trimmed_total_time = max(total_time - phase2_latencies[0], 0.0)
-        else:
-            trimmed_latencies = latencies
-            trimmed_total_time = total_time
-        trimmed_request_count = len(trimmed_latencies)
-        trimmed_avg_latency = (
-            sum(trimmed_latencies) / trimmed_request_count
-            if trimmed_request_count > 0
-            else avg_latency
-        )
-        trimmed_throughput = (
-            trimmed_request_count / trimmed_total_time
-            if trimmed_total_time > 0
-            else 0.0
-        )
-        
         # Combine stats from both phases
         import_hits = phase1_stats['import_hits'] + phase2_stats['import_hits']
         import_misses = phase1_stats['import_misses'] + phase2_stats['import_misses']
@@ -847,22 +822,13 @@ def run_benchmark(
             'phase2_cross_hits': phase2_stats.get('cross_hits', 0),
             'phase2_import_hits': phase2_stats.get('import_hits', 0),
             'phase2_import_misses': phase2_stats.get('import_misses', 0),
-            'avg_latency_ex_first': trimmed_avg_latency,
-            'total_latency_ex_first': trimmed_total_time,
-            'throughput_ex_first': trimmed_throughput if trimmed_request_count > 0 else throughput,
             'num_requests': len(latencies),
-            'num_requests_ex_first': trimmed_request_count,
         }
         run_stats.append(run_stat)
         
         print(f"  Average latency: {avg_latency:.4f}s")
         print(f"  Total time: {total_time:.4f}s")
         print(f"  Throughput: {throughput:.2f} req/s")
-        if drop_first_phase2 and trimmed_request_count > 0:
-            print(
-                f"    (excluding first request) avg latency: {trimmed_avg_latency:.4f}s, "
-                f"throughput: {trimmed_throughput:.2f} req/s"
-            )
         if kv_marketplace:
             print(f"  Registry size: {total_registry_size}")
             print(f"  Prefix index size: {total_prefix_index_size}")
@@ -880,28 +846,6 @@ def run_benchmark(
     # Sum up the batched wall-clock times from each run
     overall_total_time = sum(run_stat['total_latency'] for run_stat in run_stats)
     overall_throughput = len(phase1_prompts + phase2_prompts) * num_runs / overall_total_time if overall_total_time > 0 else 0
-    trimmed_request_count = sum(
-        r.get('num_requests_ex_first', r.get('num_requests', 0)) for r in run_stats
-    )
-    total_trimmed_latency = sum(
-        r.get('avg_latency_ex_first', r.get('avg_latency', 0.0))
-        * r.get('num_requests_ex_first', r.get('num_requests', 0))
-        for r in run_stats
-    )
-    overall_avg_latency_ex_first = (
-        total_trimmed_latency / trimmed_request_count
-        if trimmed_request_count > 0
-        else overall_avg_latency
-    )
-    overall_total_time_ex_first = sum(
-        r.get('total_latency_ex_first', r.get('total_latency', 0.0)) for r in run_stats
-    )
-    overall_throughput_ex_first = (
-        trimmed_request_count / overall_total_time_ex_first
-        if trimmed_request_count > 0 and overall_total_time_ex_first > 0
-        else 0.0
-    )
-    
     final_stats = get_registry_stats(get_stats_fn)
     
     # Aggregate import stats across all runs
@@ -917,11 +861,8 @@ def run_benchmark(
         'num_runs': num_runs,
         'num_prompts': len(phase1_prompts) + len(phase2_prompts),
         'avg_latency': overall_avg_latency,
-        'avg_latency_ex_first': overall_avg_latency_ex_first,
         'total_latency': overall_total_time,
-        'total_latency_ex_first': overall_total_time_ex_first,
         'throughput': overall_throughput,
-        'throughput_ex_first': overall_throughput_ex_first,
         'registry_size': final_stats['registry_size'],
         'prefix_index_size': final_stats['prefix_index_size'],
         'import_hits': total_import_hits,
@@ -934,15 +875,6 @@ def run_benchmark(
         'all_latencies': all_latencies,
         'all_outputs': all_outputs,
     }
-
-    if trimmed_request_count > 0:
-        print(
-            f"\nOverall avg latency (excluding first request): {overall_avg_latency_ex_first:.4f}s"
-        )
-        if overall_throughput_ex_first > 0:
-            print(
-                f"Overall throughput (excluding first request): {overall_throughput_ex_first:.2f} req/s"
-            )
 
     if kv_marketplace and shutdown_backends_fn:
         try:
@@ -1054,35 +986,6 @@ def create_comparison_chart(results_with: Dict, results_without: Dict):
                 improvement_str = f"{improvement:+.1f}%"
             elif 'throughput' in key.lower():
                 # For throughput, higher is better
-                improvement = ((with_val - without_val) / without_val) * 100
-                improvement_str = f"{improvement:+.1f}%"
-            else:
-                improvement_str = "N/A"
-        else:
-            improvement_str = "N/A"
-        
-        without_str = f"{formatter(without_val)}{unit}" if without_val > 0 else "N/A"
-        with_str = f"{formatter(with_val)}{unit}" if with_val > 0 else "N/A"
-        
-        print(f"  {name:<23} {without_str:<20} {with_str:<20} {improvement_str:<20}")
-    
-    # Steady-state overall metrics (excluding first Phase 2 request)
-    steady_metrics = [
-        ('Avg Latency (ex first)', 'avg_latency_ex_first', 's', lambda x: x),
-        ('Total Latency (ex first)', 'total_latency_ex_first', 's', lambda x: x),
-        ('Throughput (ex first)', 'throughput_ex_first', 'req/s', lambda x: x),
-    ]
-    
-    print("\n  STEADY-STATE (excluding first Phase 2 request):")
-    for name, key, unit, formatter in steady_metrics:
-        without_val = results_without.get(key, 0)
-        with_val = results_with.get(key, 0)
-        
-        if without_val > 0:
-            if 'latency' in key.lower() or 'total' in key.lower():
-                improvement = ((without_val - with_val) / without_val) * 100
-                improvement_str = f"{improvement:+.1f}%"
-            elif 'throughput' in key.lower():
                 improvement = ((with_val - without_val) / without_val) * 100
                 improvement_str = f"{improvement:+.1f}%"
             else:
@@ -1239,6 +1142,8 @@ Examples:
     parser.add_argument('--system-prompt', type=str,
                        default="You are a helpful AI assistant. Answer the user's questions concisely and accurately.",
                        help='Shared system prompt (default: helpful assistant prompt)')
+    parser.add_argument('--system-prompt-file', type=str, default=None,
+                       help='Path to a file containing the system prompt (overrides --system-prompt if set)')
     parser.add_argument('--user-prompts', type=str, nargs='+',
                        default=[
                            "What is the capital of France?",
@@ -1272,6 +1177,16 @@ Examples:
                        help='Disable Phase 2 prefix prefetch onto destination GPU (default: enabled)')
     
     args = parser.parse_args()
+    
+    if args.system_prompt_file:
+        prompt_path = os.path.expanduser(args.system_prompt_file)
+        try:
+            with open(prompt_path, 'r', encoding='utf-8') as f:
+                args.system_prompt = f.read().strip()
+            print(f"Loaded system prompt from {prompt_path} ({len(args.system_prompt)} chars)")
+        except Exception as e:
+            print(f"ERROR: Failed to load system prompt file '{prompt_path}': {e}")
+            sys.exit(1)
     
     # Check CUDA availability
     try:
