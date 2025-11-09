@@ -321,24 +321,51 @@ The demo will display:
 Example output snippet:
 ```
 [...]
-Phase 2 total time: 5.7529s
-Phase 2 average latency: 0.5753s per request
-Phase 2 stats: registry_size=10, prefix_index_size=16341
-  Average latency: 0.5856s
-  Total time: 11.7123s
-  Throughput: 1.71 req/s
+Phase 2 total time: 1.7999s
+Phase 2 average latency: 0.1800s per request
+Phase 2 stats: registry_size=10, prefix_index_size=16368
+  Average latency: 0.4309s
+  Total time: 8.6171s
+  Throughput: 2.32 req/s
   Registry size: 10
-  Prefix index size: 16341
-[...]
+  Prefix index size: 16368
+
 ================================================================================
-PHASE 2 METRICS (per run)
-================================================================================                                                                                                                  
-Run    Metric               Without kv-mkt       With kv-mkt          Improvement                                      
--------------------------------------------------------------------------------- 
-[...] 
-Run 5  Avg Latency          0.5823606491088869s  0.5753178596496582s  +1.2%               
-       Total Time           5.823606491088867s   5.753178596496582s   +1.2%               
-       Throughput           1.7171489892563556req/s 1.7381695757002111req/s +1.2%
+  COMPARISON CHART
+================================================================================
+
+Metric                    Without kv-mkt       With kv-mkt          Improvement         
+-------------------------------------------------------------------------------------
+
+  PHASE 1 (Avg across runs):
+  Phase 1 Avg Latency     0.6669254779815673s  0.6817198276519775s  -2.2%
+  Phase 1 Total Time      6.669254779815674s   6.817198276519775s   -2.2%
+  Phase 1 Throughput      1.4994179005223702req/s 1.4668782679304826req/s -2.2%
+
+  PHASE 2 (Avg across runs):
+  Phase 2 Avg Latency     0.666431188583374s   0.17999377250671383s +73.0%
+  Phase 2 Total Time      6.66431188583374s    1.7999377250671387s  +73.0%
+  Phase 2 Throughput      1.50053001289704req/s 5.555747768788498req/s +270.3%
+
+================================================================================
+  PHASE 1 METRICS (per run)
+================================================================================
+
+Run    Metric               Without kv-mkt       With kv-mkt          Improvement
+--------------------------------------------------------------------------------
+Run 1  Avg Latency          0.6669254779815673s  0.6817198276519775s  -2.2%
+       Total Time           6.669254779815674s   6.817198276519775s   -2.2%
+       Throughput           1.4994179005223702req/s 1.4668782679304826req/s -2.2%
+
+================================================================================
+  PHASE 2 METRICS (per run)
+================================================================================
+
+Run    Metric               Without kv-mkt       With kv-mkt          Improvement
+--------------------------------------------------------------------------------
+Run 1  Avg Latency          0.666431188583374s   0.17999377250671383s +73.0%
+       Total Time           6.66431188583374s    1.7999377250671387s  +73.0%
+       Throughput           1.50053001289704req/s 5.555747768788498req/s +270.3%
 
 ================================================================================
 

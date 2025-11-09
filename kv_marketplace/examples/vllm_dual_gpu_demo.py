@@ -641,7 +641,6 @@ def run_benchmark(
         'max_tokens': 256,
     }
     phase2_sampling_params_dict = dict(phase1_sampling_params_dict)
-    phase2_sampling_params_dict['max_tokens'] = 64
     
     print("\nUsing separate processes for cross-GPU testing (one process per GPU)")
     
