@@ -500,6 +500,9 @@ def run_benchmark(
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
     prefetch_phase2: bool = True,
+    dtype: str = "float16",
+    speculative_config: Optional[Dict] = None,
+    tokenizer_mode: str = "mistral",
     **llm_kwargs
 ) -> Dict:
     """Run benchmark with or without kv-marketplace.
@@ -603,6 +606,14 @@ def run_benchmark(
         os.environ.setdefault('KV_MARKETPLACE_HANDLE_CACHE_SIZE', 'inf')
     
     # Shared kwargs for both child processes
+    if speculative_config is None:
+        speculative_config = {
+            "method": "ngram",
+            "num_speculative_tokens": 6,
+            "prompt_lookup_min": 3,
+            "prompt_lookup_max": 8,
+        }
+
     shared_kwargs = {
         'kv_marketplace': kv_marketplace,
         'kv_min_prefix': kv_min_prefix,
@@ -615,6 +626,9 @@ def run_benchmark(
         # (set in child_run before any torch/vllm imports)
         **llm_kwargs
     }
+    shared_kwargs.setdefault('dtype', dtype)
+    shared_kwargs.setdefault('tokenizer_mode', tokenizer_mode)
+    shared_kwargs.setdefault('speculative_config', speculative_config)
     # Guard against accidental 'device' kwargs sneaking in through llm_kwargs/etc.
     shared_kwargs.pop('device', None)
     
@@ -622,8 +636,8 @@ def run_benchmark(
     # This prevents msgspec validation errors when the object is pickled/unpickled across processes
     # We'll recreate it fresh in the child process to ensure proper vLLM serialization
     phase1_sampling_params_dict = {
-        'temperature': 0.7,
-        'top_p': .9,
+        'temperature': 0.0,
+        'top_p': 1.0,
         'max_tokens': 256,
     }
     phase2_sampling_params_dict = dict(phase1_sampling_params_dict)

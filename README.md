@@ -288,7 +288,7 @@ python kv_marketplace/examples/vllm_dual_gpu_demo.py --model gpt2 --kv-min-prefi
 Use custom system prompts and user prompts to see the benefit for longer prefixes:
 
 ```bash
-python kv_marketplace/examples/vllm_dual_gpu_demo.py \
+VLLM_LOGGING_LEVEL=error python kv_marketplace/examples/vllm_dual_gpu_demo.py \
     --model mistralai/Mistral-7B-Instruct-v0.3 \
     --system-prompt-file kv_marketplace/examples/PROMPT.txt \
     --user-prompts \
