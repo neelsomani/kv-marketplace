@@ -563,6 +563,10 @@ def run_benchmark(
         print(f"Detected {torch.cuda.device_count()} GPUs, shared-memory registry backend enabled for cross-process sharing")
     else:
         os.environ.pop('KV_MARKETPLACE_FILE_BACKEND', None)
+
+    # Prefer FlashInfer samplers whenever nvcc/flashinfer wheels are available.
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "1")
+    os.environ.setdefault("VLLM_USE_FLASHINFER", "1")
     
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         print("ERROR: Need at least 2 GPUs for cross-GPU benchmark")

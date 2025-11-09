@@ -43,4 +43,3 @@ kv_marketplace = ["transport/*.cpp"]
 testpaths = ["kv_marketplace/tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
-

@@ -124,6 +124,11 @@ pip3 install -e .
 
 # Verify the installation
 python -c "from kv_marketplace.transport import PeerCopy; print('Installation successful')"
+
+# Install FlashInfer
+pip install flashinfer-python flashinfer-cubin
+# JIT cache matching CUDA 12.8 (cu128):
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu128
 ```
 
 ### Building the CUDA Extension
