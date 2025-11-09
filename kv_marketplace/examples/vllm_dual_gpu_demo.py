@@ -621,11 +621,13 @@ def run_benchmark(
     # Convert SamplingParams to dict for multiprocessing (avoids serialization issues with vLLM)
     # This prevents msgspec validation errors when the object is pickled/unpickled across processes
     # We'll recreate it fresh in the child process to ensure proper vLLM serialization
-    sampling_params_dict = {
+    phase1_sampling_params_dict = {
         'temperature': 0.7,
         'top_p': .9,
         'max_tokens': 256,
     }
+    phase2_sampling_params_dict = dict(phase1_sampling_params_dict)
+    phase2_sampling_params_dict['max_tokens'] = 64
     
     print("\nUsing separate processes for cross-GPU testing (one process per GPU)")
     
@@ -651,8 +653,10 @@ def run_benchmark(
         
         # Phase 1: Process on GPU 0
         print(f"\n--- Phase 1: Warm-up ({len(phase1_prompts)} requests on GPU 0) ---")
-        p1 = Process(target=child_run, args=("0", model, shared_kwargs, phase1_prompts, 
-                                             sampling_params_dict, q1, "Phase1"))
+        p1 = Process(
+            target=child_run,
+            args=("0", model, shared_kwargs, phase1_prompts, phase1_sampling_params_dict, q1, "Phase1"),
+        )
         p1.start()
         
         # Wait for child result first; if it wedges, we can terminate it
@@ -706,7 +710,7 @@ def run_benchmark(
         prefetch_kwargs = {}
         if kv_marketplace and prefetch_phase2:
             print(f"\n--- Prefetching Phase 2 prefixes onto GPU 1 (will reuse same worker) ---")
-            prefetch_sampling_params = dict(sampling_params_dict)
+            prefetch_sampling_params = dict(phase2_sampling_params_dict)
             prefetch_sampling_params['max_tokens'] = max(1, prefetch_sampling_params.get('max_tokens', 1))
             prefetch_sampling_params['temperature'] = 0.0
             prefetch_sampling_params['top_p'] = 1.0
@@ -721,7 +725,7 @@ def run_benchmark(
         # Make GPU1 the first visible device so vLLM picks it, but keep GPU0 visible for P2P
         p2 = Process(
             target=child_run,
-            args=("1,0", model, shared_kwargs, phase2_prompts, sampling_params_dict, q2, "Phase2"),
+            args=("1,0", model, shared_kwargs, phase2_prompts, phase2_sampling_params_dict, q2, "Phase2"),
             kwargs=prefetch_kwargs,
         )
         p2.start()
