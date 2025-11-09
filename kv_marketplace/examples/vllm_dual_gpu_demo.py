@@ -1171,8 +1171,13 @@ Examples:
                        help='Print registry keys at the end (default: False)')
     parser.add_argument('--no-prefetch-phase2', action='store_true',
                        help='Disable Phase 2 prefix prefetch onto destination GPU (default: enabled)')
+    parser.add_argument('--enable-logging', action='store_true',
+                       help='Enable kv-marketplace INFO logging (default: disabled)')
     
     args = parser.parse_args()
+
+    if args.enable_logging:
+        logging.getLogger("kv_marketplace").setLevel(logging.INFO)
     
     if args.system_prompt_file:
         prompt_path = os.path.expanduser(args.system_prompt_file)
