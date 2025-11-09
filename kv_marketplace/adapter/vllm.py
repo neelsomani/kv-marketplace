@@ -19,9 +19,8 @@ from ..transport.p2p import PeerCopy
 from ..transport import p2p_cuda
 
 logger = logging.getLogger(__name__)
-# Set kv-marketplace logger to INFO to avoid debug overhead in hot paths
-# (vLLM may set root logger to DEBUG, but we want to avoid debug logging overhead)
-logger.setLevel(logging.INFO)
+# Silence adapter logs unless something goes wrong.
+logger.setLevel(logging.ERROR)
 
 # Detect if we should use file-based backend for multi-process sharing
 # Use environment variable to enable, or auto-detect based on data parallelism
