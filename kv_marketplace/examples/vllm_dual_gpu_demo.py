@@ -503,6 +503,7 @@ def run_benchmark(
     print_outputs: bool = False,
     dtype: str = "float16",
     speculative_config: Optional[Dict] = None,
+    enable_speculative: bool = True,
     tokenizer_mode: str = "mistral",
     **llm_kwargs
 ) -> Dict:
@@ -520,6 +521,7 @@ def run_benchmark(
         max_model_len: Maximum model length
         prefetch_phase2: Prefetch Phase 2 prefixes onto destination GPU before measurement
         print_outputs: Print generated text for each phase/run
+        enable_speculative: Enable speculative decoding (ngram draft) in vLLM
         **llm_kwargs: Additional LLM arguments
         
     Returns:
@@ -535,6 +537,8 @@ def run_benchmark(
     print(f"KV Marketplace: {kv_marketplace}")
     if kv_marketplace:
         print(f"KV Min Prefix: {kv_min_prefix}")
+    if not enable_speculative:
+        print("Speculative decoding: DISABLED")
     
     # Create 10 different prefixes from system prompt by splitting on '. '
     print(f"\nCreating {10} different prefixes from system prompt...")
@@ -608,13 +612,15 @@ def run_benchmark(
         os.environ.setdefault('KV_MARKETPLACE_HANDLE_CACHE_SIZE', 'inf')
     
     # Shared kwargs for both child processes
-    if speculative_config is None:
+    if speculative_config is None and enable_speculative:
         speculative_config = {
             "method": "ngram",
             "num_speculative_tokens": 6,
             "prompt_lookup_min": 3,
             "prompt_lookup_max": 8,
         }
+    elif not enable_speculative:
+        speculative_config = None
 
     shared_kwargs = {
         'kv_marketplace': kv_marketplace,
@@ -630,9 +636,12 @@ def run_benchmark(
     }
     shared_kwargs.setdefault('dtype', dtype)
     shared_kwargs.setdefault('tokenizer_mode', tokenizer_mode)
-    shared_kwargs.setdefault('speculative_config', speculative_config)
     # Guard against accidental 'device' kwargs sneaking in through llm_kwargs/etc.
     shared_kwargs.pop('device', None)
+    if enable_speculative and speculative_config:
+        shared_kwargs.setdefault('speculative_config', speculative_config)
+    else:
+        shared_kwargs.pop('speculative_config', None)
     
     # Convert SamplingParams to dict for multiprocessing (avoids serialization issues with vLLM)
     # This prevents msgspec validation errors when the object is pickled/unpickled across processes
@@ -1185,6 +1194,8 @@ Examples:
                        help='Enable kv-marketplace INFO logging (default: disabled)')
     parser.add_argument('--print-outputs', action='store_true',
                        help='Print all generated outputs for each run (default: hidden)')
+    parser.add_argument('--disable-speculative', action='store_true',
+                       help='Disable speculative decoding when constructing the LLM (default: enabled)')
     
     args = parser.parse_args()
 
@@ -1242,6 +1253,7 @@ Examples:
                 max_model_len=args.max_model_len,
                 prefetch_phase2=prefetch_phase2,
                 print_outputs=args.print_outputs,
+                enable_speculative=not args.disable_speculative,
             )
         else:
             results_without = None
@@ -1262,6 +1274,7 @@ Examples:
             max_model_len=args.max_model_len,
             prefetch_phase2=prefetch_phase2,
             print_outputs=args.print_outputs,
+            enable_speculative=not args.disable_speculative,
         )
         
         # Create comparison chart (only if both results exist)
@@ -1302,6 +1315,7 @@ Examples:
             max_model_len=args.max_model_len,
             prefetch_phase2=prefetch_phase2,
             print_outputs=args.print_outputs,
+            enable_speculative=not args.disable_speculative,
         )
         
         if results:
