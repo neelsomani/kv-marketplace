@@ -500,6 +500,7 @@ def run_benchmark(
     tensor_parallel_size: int = 1,
     max_model_len: int = 4096,
     prefetch_phase2: bool = True,
+    print_outputs: bool = False,
     dtype: str = "float16",
     speculative_config: Optional[Dict] = None,
     tokenizer_mode: str = "mistral",
@@ -518,6 +519,7 @@ def run_benchmark(
         tensor_parallel_size: Tensor parallelism (1 = single GPU)
         max_model_len: Maximum model length
         prefetch_phase2: Prefetch Phase 2 prefixes onto destination GPU before measurement
+        print_outputs: Print generated text for each phase/run
         **llm_kwargs: Additional LLM arguments
         
     Returns:
@@ -783,6 +785,15 @@ def run_benchmark(
             print(f"Phase 2 stats: registry_size={phase2_stats['registry_size']}, "
                   f"prefix_index_size={phase2_stats['prefix_index_size']}")
         
+        if print_outputs:
+            print(f"\nRun {run_idx + 1} outputs:")
+            for idx, output in enumerate(phase1_outputs, 1):
+                text = output.strip()
+                print(f"  [Phase 1 #{idx}] {text if text else '(empty output)'}")
+            for idx, output in enumerate(phase2_outputs, 1):
+                text = output.strip()
+                print(f"  [Phase 2 #{idx}] {text if text else '(empty output)'}")
+    
         # Combine results
         latencies = phase1_latencies + phase2_latencies
         outputs = phase1_outputs + phase2_outputs
@@ -1172,6 +1183,8 @@ Examples:
                        help='Disable Phase 2 prefix prefetch onto destination GPU (default: enabled)')
     parser.add_argument('--enable-logging', action='store_true',
                        help='Enable kv-marketplace INFO logging (default: disabled)')
+    parser.add_argument('--print-outputs', action='store_true',
+                       help='Print all generated outputs for each run (default: hidden)')
     
     args = parser.parse_args()
 
@@ -1228,6 +1241,7 @@ Examples:
                 tensor_parallel_size=args.tensor_parallel_size,
                 max_model_len=args.max_model_len,
                 prefetch_phase2=prefetch_phase2,
+                print_outputs=args.print_outputs,
             )
         else:
             results_without = None
@@ -1247,6 +1261,7 @@ Examples:
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len,
             prefetch_phase2=prefetch_phase2,
+            print_outputs=args.print_outputs,
         )
         
         # Create comparison chart (only if both results exist)
@@ -1286,6 +1301,7 @@ Examples:
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len,
             prefetch_phase2=prefetch_phase2,
+            print_outputs=args.print_outputs,
         )
         
         if results:
