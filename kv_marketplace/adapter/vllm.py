@@ -6,8 +6,10 @@ import os
 import tempfile
 import time
 import atexit
+import math
+import ctypes
 from collections import OrderedDict
-from typing import Callable, Optional, Tuple, List, TypedDict
+from typing import Callable, Optional, Tuple, List, TypedDict, Union
 import torch
 from .types import KVLayout, AllocatedKV
 from ..compat import KVCompat
@@ -108,6 +110,8 @@ _REHOME_AFTER_IMPORT = _env_flag('KV_MARKETPLACE_REHOME_AFTER_IMPORT')
 if _REHOME_AFTER_IMPORT:
     logger.info("kv-marketplace: imported prefixes will be re-registered on destination GPUs")
 
+_DUMP_MAX_TOKENS = _env_int('KV_MARKETPLACE_DUMP_MAX_TOKENS', 0)
+
 # File-based stats sharing for multiprocessing
 _stats_file = None
 _stats_lock_file = None
@@ -182,6 +186,153 @@ def _register_handle_for_device(
             device_id,
             exc,
         )
+
+
+def _resolve_cache_dtype(compat: Union[KVCompat, dict], layout_meta: Optional[dict] = None) -> Tuple[str, int]:
+    """Resolve cache dtype (string + bytes per element) from layout/compat metadata."""
+    candidates = []
+    if layout_meta:
+        candidates.append(layout_meta.get('dtype'))
+    try:
+        if isinstance(compat, KVCompat):
+            candidates.append(compat.layout_config.get('dtype'))
+        elif isinstance(compat, dict):
+            kv_layout = compat.get('kv_layout', {})
+            if isinstance(kv_layout, dict):
+                candidates.append(kv_layout.get('dtype'))
+    except Exception:
+        pass
+    dtype_str = next((str(c).lower() for c in candidates if c), 'float16')
+    dtype_size = 2
+    if 'float8' in dtype_str or 'fp8' in dtype_str:
+        dtype_size = 1
+    elif 'float32' in dtype_str or 'fp32' in dtype_str:
+        dtype_size = 4
+    # float16/half/bfloat16 default to 2 bytes
+    return dtype_str, dtype_size
+
+
+def _dump_pointer_list_to_files(
+    kind: str,
+    ptrs: list,
+    entry_dir: str,
+    meta: dict,
+    length: int,
+    dtype_size: int,
+    device_id: int,
+) -> None:
+    """Copy a list of device pointers (per layer) to host binary files."""
+    if not ptrs:
+        return
+    try:
+        import torch
+    except ImportError:
+        logger.warning("kv-marketplace: torch not available for KV dump")
+        return
+    if not torch.cuda.is_available():
+        return
+    n_layers = len(ptrs)
+    n_kv_heads = int(meta.get('n_kv_heads') or 0)
+    head_dim = int(meta.get('head_dim') or 0)
+    page_size = int(meta.get('page_size') or 1)
+    if n_layers == 0 or n_kv_heads == 0 or head_dim == 0 or dtype_size <= 0:
+        return
+    dump_tokens = length
+    if _DUMP_MAX_TOKENS > 0:
+        dump_tokens = min(dump_tokens, _DUMP_MAX_TOKENS)
+    if dump_tokens <= 0:
+        return
+    page_size = max(1, page_size)
+    tokens_rounded = int(math.ceil(dump_tokens / page_size) * page_size)
+    bytes_per_token = n_kv_heads * head_dim * dtype_size
+    total_bytes = tokens_rounded * bytes_per_token
+    if total_bytes <= 0:
+        return
+    try:
+        cuda_runtime = torch.cuda.cudart()
+        memcpy_kind = cuda_runtime.cudaMemcpyDeviceToHost
+    except Exception as exc:
+        logger.warning("kv-marketplace: unable to access cudaMemcpy for KV dump: %s", exc)
+        return
+    try:
+        torch.cuda.set_device(device_id)
+    except Exception:
+        pass
+    for layer_idx, ptr in enumerate(ptrs):
+        if not ptr:
+            continue
+        try:
+            host_buf = torch.empty(total_bytes, dtype=torch.uint8, device='cpu')
+            dst_ptr = ctypes.c_void_p(host_buf.data_ptr())
+            src_ptr = ctypes.c_void_p(ptr)
+            status = cuda_runtime.cudaMemcpy(dst_ptr, src_ptr, total_bytes, memcpy_kind)
+            if status != 0:
+                logger.warning(
+                    "kv-marketplace: cudaMemcpy status=%s while dumping %s layer %s (bytes=%s)",
+                    status,
+                    kind,
+                    layer_idx,
+                    total_bytes,
+                )
+                continue
+            arr = host_buf.numpy()
+            layer_path = os.path.join(entry_dir, f"{kind}_layer{layer_idx:03d}.bin")
+            arr.tofile(layer_path)
+        except Exception as exc:
+            logger.warning(
+                "kv-marketplace: failed to dump %s layer %s to disk: %s",
+                kind,
+                layer_idx,
+                exc,
+            )
+
+
+def _maybe_dump_kv_cache(
+    compat: Union[KVCompat, dict],
+    prefix_hash: bytes,
+    layout_meta: dict,
+    length: int,
+    k_ptrs: list,
+    v_ptrs: list,
+    device_id: int,
+    dump_kind: str = "export",
+) -> None:
+    """Optionally dump KV cache tensors to disk for debugging."""
+    dump_root = os.environ.get('KV_MARKETPLACE_DUMP_DIR')
+    if not dump_root:
+        return
+    try:
+        label = os.environ.get('KV_MARKETPLACE_DUMP_LABEL')
+        target_dir = os.path.join(dump_root, label) if label else dump_root
+        os.makedirs(target_dir, exist_ok=True)
+        timestamp_ms = int(time.time() * 1000)
+        entry_dir = os.path.join(
+            target_dir,
+            f"{prefix_hash.hex()}_{length}_{timestamp_ms}_{dump_kind}",
+        )
+        os.makedirs(entry_dir, exist_ok=True)
+        dtype_name, dtype_size = _resolve_cache_dtype(compat, layout_meta)
+        dump_tokens = length if _DUMP_MAX_TOKENS <= 0 else min(length, _DUMP_MAX_TOKENS)
+        meta_path = os.path.join(entry_dir, "meta.json")
+        metadata = {
+            "compat_checksum": compat.checksum.hex() if isinstance(compat, KVCompat) else "",
+            "prefix_hash": prefix_hash.hex(),
+            "length": length,
+            "dump_tokens": dump_tokens,
+            "dtype": dtype_name,
+            "dtype_bytes": dtype_size,
+            "device_id": device_id,
+            "layout_meta": layout_meta,
+            "timestamp_ms": timestamp_ms,
+            "label": label,
+            "dump_kind": dump_kind,
+        }
+        with open(meta_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        _dump_pointer_list_to_files("k", k_ptrs, entry_dir, layout_meta, length, dtype_size, device_id)
+        _dump_pointer_list_to_files("v", v_ptrs, entry_dir, layout_meta, length, dtype_size, device_id)
+    except Exception as exc:
+        logger.warning("kv-marketplace: failed to dump KV cache: %s", exc)
 
 
 def get_stable_device_id(local_device_id: int) -> Optional[str]:
@@ -972,25 +1123,7 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             src_page_ranges = handle.layout_meta.get('page_ranges')
         
         # Get dtype size from cache config or compat
-        dtype_size = 2  # fp16 default
-        try:
-            # Try to get from compat's layout_config
-            cache_dtype = ''
-            if isinstance(compat, KVCompat):
-                cache_dtype = str(compat.layout_config.get('dtype', '')).lower()
-            elif isinstance(compat, dict):
-                cache_dtype = str(compat.get('kv_layout', {}).get('dtype', '')).lower()
-            
-            if "float8" in cache_dtype or "fp8" in cache_dtype:
-                dtype_size = 1
-            elif "float16" in cache_dtype or "fp16" in cache_dtype or "half" in cache_dtype:
-                dtype_size = 2
-            elif "bfloat16" in cache_dtype or "bf16" in cache_dtype:
-                dtype_size = 2
-            elif "float32" in cache_dtype or "fp32" in cache_dtype:
-                dtype_size = 4
-        except Exception:
-            pass
+        _, dtype_size = _resolve_cache_dtype(compat, meta)
         
         # Log bytes to copy and estimate expected bandwidth using meta (authoritative)
         bytes_per_tok = meta['n_layers'] * meta['n_kv_heads'] * meta['head_dim'] * 2 * dtype_size  # K and V
@@ -1021,6 +1154,28 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
             src_page_ranges=src_page_ranges
         )
         timings['copy_kv_ms'] = (time.perf_counter() - copy_start) * 1000.0
+
+        dump_meta = {
+            'n_layers': meta['n_layers'],
+            'n_kv_heads': meta['n_kv_heads'],
+            'head_dim': meta['head_dim'],
+            'page_size': meta['page_size'],
+            **meta.get('strides', {}),
+        }
+        if dst_page_ranges:
+            dump_meta['page_ranges'] = dst_page_ranges
+        if 'dtype' in meta:
+            dump_meta['dtype'] = meta.get('dtype')
+        _maybe_dump_kv_cache(
+            compat=compat,
+            prefix_hash=prefix_hash,
+            layout_meta=dump_meta,
+            length=lcp_len,
+            k_ptrs=k_ptrs,
+            v_ptrs=v_ptrs,
+            device_id=device_id,
+            dump_kind="import",
+        )
 
         if _REHOME_AFTER_IMPORT:
             layout_meta_for_dst = dict(meta)
@@ -1161,6 +1316,8 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         }
         if page_ranges:
             layout_meta['page_ranges'] = page_ranges
+        if 'dtype' in layout and layout.get('dtype'):
+            layout_meta.setdefault('dtype', layout.get('dtype'))
 
         _register_handle_for_device(
             compat=compat,
@@ -1174,6 +1331,17 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         
         logger.debug(f"Exported KV cache: length={length}, device={device_id}, prefix_hash={prefix_hash.hex()[:8]}..., "
                    f"num_blocks={len(k_ptrs)}")
+        
+        _maybe_dump_kv_cache(
+            compat=compat,
+            prefix_hash=prefix_hash,
+            layout_meta=layout_meta,
+            length=length,
+            k_ptrs=k_ptrs,
+            v_ptrs=v_ptrs,
+            device_id=device_id,
+            dump_kind="export",
+        )
         
     except Exception as e:
         logger.error(f"Error in after_prefill: {e}", exc_info=True)

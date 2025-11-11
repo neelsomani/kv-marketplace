@@ -21,7 +21,7 @@ import logging
 import random
 from typing import List, Dict, Tuple, Any, Optional
 from collections import defaultdict
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Event
 
 # CRITICAL: Set multiprocessing start method to 'spawn' before any CUDA initialization
 # This must be done at module level, before any imports that might initialize CUDA
@@ -158,7 +158,10 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
               sampling_params_dict: Dict, result_queue: Queue, phase_name: str,
               prefetch_only: bool = False, rehome_after_import: bool = False,
               prefetch_prompts: Optional[List[str]] = None,
-              prefetch_sampling_params_dict: Optional[Dict] = None):
+              prefetch_sampling_params_dict: Optional[Dict] = None,
+              hold_gpu_event: Optional[Event] = None,
+              dump_kv_dir: Optional[str] = None,
+              dump_kv_label: Optional[str] = None):
     """Child process function that runs one phase of the benchmark.
     
     Sets CUDA_VISIBLE_DEVICES, initializes LLM, runs batched generation,
@@ -194,6 +197,21 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
     os.environ.setdefault("RAY_USAGE_STATS_ENABLED", "0")
     os.environ.setdefault("RAY_DISABLE_IMPORT_WARNING", "1")
     logging.disable(logging.CRITICAL)
+    
+    if dump_kv_dir:
+        dump_target_dir = os.path.abspath(os.path.expanduser(dump_kv_dir))
+        os.environ['KV_MARKETPLACE_DUMP_DIR'] = dump_target_dir
+        if dump_kv_label:
+            os.environ['KV_MARKETPLACE_DUMP_LABEL'] = dump_kv_label
+        else:
+            os.environ.pop('KV_MARKETPLACE_DUMP_LABEL', None)
+        try:
+            os.makedirs(dump_target_dir, exist_ok=True)
+        except Exception:
+            pass
+    else:
+        os.environ.pop('KV_MARKETPLACE_DUMP_DIR', None)
+        os.environ.pop('KV_MARKETPLACE_DUMP_LABEL', None)
     
     # Check if kv-marketplace is enabled
     kvm_enabled = bool(shared_kwargs.get("kv_marketplace", False))
@@ -381,6 +399,11 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
         if prefetch_info is not None:
             result["prefetch"] = prefetch_info
         result_queue.put(result)
+        if hold_gpu_event is not None:
+            try:
+                hold_gpu_event.wait()
+            except KeyboardInterrupt:
+                pass
     except Exception as e:
         import traceback
         # Put error in queue with traceback for debugging
@@ -504,6 +527,7 @@ def run_benchmark(
     dtype: str = "float16",
     speculative_config: Optional[Dict] = None,
     enable_speculative: bool = True,
+    dump_kv_dir: Optional[str] = None,
     tokenizer_mode: str = "mistral",
     **llm_kwargs
 ) -> Dict:
@@ -522,6 +546,7 @@ def run_benchmark(
         prefetch_phase2: Prefetch Phase 2 prefixes onto destination GPU before measurement
         print_outputs: Print generated text for each phase/run
         enable_speculative: Enable speculative decoding (ngram draft) in vLLM
+        dump_kv_dir: Optional directory to dump exported KV pages for offline diffing
         **llm_kwargs: Additional LLM arguments
         
     Returns:
@@ -539,6 +564,10 @@ def run_benchmark(
         print(f"KV Min Prefix: {kv_min_prefix}")
     if not enable_speculative:
         print("Speculative decoding: DISABLED")
+    if dump_kv_dir:
+        dump_kv_dir = os.path.abspath(os.path.expanduser(dump_kv_dir))
+        os.makedirs(dump_kv_dir, exist_ok=True)
+        print(f"KV cache dumps enabled: {dump_kv_dir}")
     
     # Create 10 different prefixes from system prompt by splitting on '. '
     print(f"\nCreating {10} different prefixes from system prompt...")
@@ -675,13 +704,40 @@ def run_benchmark(
         q1 = Queue()
         q2 = Queue()
         
+        phase1_hold_event = Event() if kv_marketplace else None
+        phase1_dump_label = f"run{run_idx + 1}_phase1" if dump_kv_dir else None
+        phase2_dump_label = f"run{run_idx + 1}_phase2" if dump_kv_dir else None
+        child_kwargs_phase1 = {}
+        if phase1_hold_event is not None:
+            child_kwargs_phase1['hold_gpu_event'] = phase1_hold_event
+        if dump_kv_dir:
+            child_kwargs_phase1['dump_kv_dir'] = dump_kv_dir
+            child_kwargs_phase1['dump_kv_label'] = phase1_dump_label
+        
         # Phase 1: Process on GPU 0
         print(f"\n--- Phase 1: Warm-up ({len(phase1_prompts)} requests on GPU 0) ---")
         p1 = Process(
             target=child_run,
             args=("0", model, shared_kwargs, phase1_prompts, phase1_sampling_params_dict, q1, "Phase1"),
+            kwargs=child_kwargs_phase1,
         )
         p1.start()
+        
+        phase1_cleanup_done = False
+        def cleanup_phase1():
+            nonlocal phase1_cleanup_done
+            if phase1_cleanup_done:
+                return
+            if phase1_hold_event is not None:
+                phase1_hold_event.set()
+            try:
+                p1.join(10)
+            except Exception:
+                pass
+            if p1.is_alive():
+                p1.terminate()
+                p1.join(10)
+            phase1_cleanup_done = True
         
         # Wait for child result first; if it wedges, we can terminate it
         try:
@@ -696,16 +752,11 @@ def run_benchmark(
         q1.close()
         q1.join_thread()
         
-        # Now safe to join (should be quick if child exited)
-        p1.join(10)
-        if p1.is_alive():
-            p1.terminate()
-            p1.join(10)
-        
         if "error" in r1:
             print(f"ERROR in Phase 1: {r1['error']}")
             if "traceback" in r1:
                 print(f"Traceback:\n{r1['traceback']}")
+            cleanup_phase1()
             return None
         
         phase1_latencies = r1["latencies"]
@@ -720,162 +771,169 @@ def run_benchmark(
                   f"local_hits={phase1_stats['local_hits']}, "
                   f"cross_hits={phase1_stats['cross_hits']}")
         
-        # Reset stats so measured Phase 2 excludes Phase 1 and prefetch activity
-        if kv_marketplace and reset_stats_fn:
-            try:
-                reset_stats_fn()
-                print("Reset stats before measured Phase 2 (registry preserved)")
-            except Exception as e:
-                print(f"Warning: Failed to reset stats before Phase 2: {e}")
-        
-        # Barrier
-        time.sleep(0.5)
-        
-        prefetch_kwargs = {}
-        if kv_marketplace and prefetch_phase2:
-            print(f"\n--- Prefetching Phase 2 prefixes onto GPU 1 (will reuse same worker) ---")
-            prefetch_sampling_params = dict(phase2_sampling_params_dict)
-            prefetch_sampling_params['max_tokens'] = max(1, prefetch_sampling_params.get('max_tokens', 1))
-            prefetch_sampling_params['temperature'] = 0.0
-            prefetch_sampling_params['top_p'] = 1.0
-            prefetch_kwargs = {
-                'prefetch_prompts': phase2_prompts,
-                'prefetch_sampling_params_dict': prefetch_sampling_params,
-                'rehome_after_import': True,
-            }
-        # Phase 2: Process on GPU 1 (forces cross-GPU)
-        # Make both GPUs visible so Phase 2 can import from GPU 0
-        print(f"\n--- Phase 2: Test ({len(phase2_prompts)} requests on GPU 1) ---")
-        # Make GPU1 the first visible device so vLLM picks it, but keep GPU0 visible for P2P
-        p2 = Process(
-            target=child_run,
-            args=("1,0", model, shared_kwargs, phase2_prompts, phase2_sampling_params_dict, q2, "Phase2"),
-            kwargs=prefetch_kwargs,
-        )
-        p2.start()
-        
-        # Wait for child result first; if it wedges, we can terminate it
         try:
-            r2 = q2.get(timeout=300)  # 5 minute timeout (adjust as needed)
-        except Exception as e:
+            # Reset stats so measured Phase 2 excludes Phase 1 and prefetch activity
+            if kv_marketplace and reset_stats_fn:
+                try:
+                    reset_stats_fn()
+                    print("Reset stats before measured Phase 2 (registry preserved)")
+                except Exception as e:
+                    print(f"Warning: Failed to reset stats before Phase 2: {e}")
+        
+            # Barrier
+            time.sleep(0.5)
+        
+            prefetch_kwargs = {}
+            if kv_marketplace and prefetch_phase2:
+                print(f"\n--- Prefetching Phase 2 prefixes onto GPU 1 (will reuse same worker) ---")
+                prefetch_sampling_params = dict(phase2_sampling_params_dict)
+                prefetch_sampling_params['max_tokens'] = max(1, prefetch_sampling_params.get('max_tokens', 1))
+                prefetch_sampling_params['temperature'] = 0.0
+                prefetch_sampling_params['top_p'] = 1.0
+                prefetch_kwargs = {
+                    'prefetch_prompts': phase2_prompts,
+                    'prefetch_sampling_params_dict': prefetch_sampling_params,
+                    'rehome_after_import': True,
+                }
+            child_kwargs_phase2 = dict(prefetch_kwargs)
+            if dump_kv_dir:
+                child_kwargs_phase2['dump_kv_dir'] = dump_kv_dir
+                child_kwargs_phase2['dump_kv_label'] = phase2_dump_label
+            # Phase 2: Process on GPU 1 (forces cross-GPU)
+            # Make both GPUs visible so Phase 2 can import from GPU 0
+            print(f"\n--- Phase 2: Test ({len(phase2_prompts)} requests on GPU 1) ---")
+            # Make GPU1 the first visible device so vLLM picks it, but keep GPU0 visible for P2P
+            p2 = Process(
+                target=child_run,
+                args=("1,0", model, shared_kwargs, phase2_prompts, phase2_sampling_params_dict, q2, "Phase2"),
+                kwargs=child_kwargs_phase2,
+            )
+            p2.start()
+        
+            # Wait for child result first; if it wedges, we can terminate it
+            try:
+                r2 = q2.get(timeout=300)  # 5 minute timeout (adjust as needed)
+            except Exception as e:
+                if p2.is_alive():
+                    p2.terminate()
+                    p2.join(10)
+                raise RuntimeError(f"Phase 2 child timed out before returning a result: {e}")
+        
+            # Close queue to prevent leaked semaphores
+            q2.close()
+            q2.join_thread()
+        
+            # Now safe to join (should be quick if child exited)
+            p2.join(10)
             if p2.is_alive():
                 p2.terminate()
                 p2.join(10)
-            raise RuntimeError(f"Phase 2 child timed out before returning a result: {e}")
+            if kv_marketplace and prefetch_phase2:
+                pref_info = r2.get("prefetch")
+                if pref_info:
+                    print(f"Prefetch completed in {pref_info.get('wall', 0.0):.4f}s")
         
-        # Close queue to prevent leaked semaphores
-        q2.close()
-        q2.join_thread()
+            if "error" in r2:
+                print(f"ERROR in Phase 2: {r2['error']}")
+                if "traceback" in r2:
+                    print(f"Traceback:\n{r2['traceback']}")
+                return None
         
-        # Now safe to join (should be quick if child exited)
-        p2.join(10)
-        if p2.is_alive():
-            p2.terminate()
-            p2.join(10)
-        if kv_marketplace and prefetch_phase2:
-            pref_info = r2.get("prefetch")
-            if pref_info:
-                print(f"Prefetch completed in {pref_info.get('wall', 0.0):.4f}s")
+            phase2_latencies = r2["latencies"]
+            phase2_outputs = r2["outputs"]
+            phase2_total_time = r2["wall"]
+            phase2_stats = norm_stats(r2["stats"])
         
-        if "error" in r2:
-            print(f"ERROR in Phase 2: {r2['error']}")
-            if "traceback" in r2:
-                print(f"Traceback:\n{r2['traceback']}")
-            return None
+            print(f"Phase 2 total time: {phase2_total_time:.4f}s")
+            print(f"Phase 2 average latency: {sum(phase2_latencies) / len(phase2_latencies):.4f}s per request")
+            if kv_marketplace:
+                print(f"Phase 2 stats: registry_size={phase2_stats['registry_size']}, "
+                      f"prefix_index_size={phase2_stats['prefix_index_size']}")
         
-        phase2_latencies = r2["latencies"]
-        phase2_outputs = r2["outputs"]
-        phase2_total_time = r2["wall"]
-        phase2_stats = norm_stats(r2["stats"])
-        
-        print(f"Phase 2 total time: {phase2_total_time:.4f}s")
-        print(f"Phase 2 average latency: {sum(phase2_latencies) / len(phase2_latencies):.4f}s per request")
-        if kv_marketplace:
-            print(f"Phase 2 stats: registry_size={phase2_stats['registry_size']}, "
-                  f"prefix_index_size={phase2_stats['prefix_index_size']}")
-        
-        if print_outputs:
-            print(f"\nRun {run_idx + 1} outputs:")
-            for idx, output in enumerate(phase1_outputs, 1):
-                text = output.strip()
-                print(f"  [Phase 1 #{idx}] {text if text else '(empty output)'}")
-            for idx, output in enumerate(phase2_outputs, 1):
-                text = output.strip()
-                print(f"  [Phase 2 #{idx}] {text if text else '(empty output)'}")
-    
-        # Combine results
-        latencies = phase1_latencies + phase2_latencies
-        outputs = phase1_outputs + phase2_outputs
-        all_latencies.extend(latencies)
-        all_outputs.extend(outputs)
-        
-        # Calculate run statistics
-        avg_latency = sum(latencies) / len(latencies)
-        total_time = phase1_total_time + phase2_total_time  # Sum of wall-clock times
-        throughput = len(latencies) / total_time if total_time > 0 else 0
+            if print_outputs:
+                print(f"\nRun {run_idx + 1} outputs:")
+                for idx, output in enumerate(phase1_outputs, 1):
+                    text = output.strip()
+                    print(f"  [Phase 1 #{idx}] {text if text else '(empty output)'}")
+                for idx, output in enumerate(phase2_outputs, 1):
+                    text = output.strip()
+                    print(f"  [Phase 2 #{idx}] {text if text else '(empty output)'}")
 
-        # Combine stats from both phases
-        import_hits = phase1_stats['import_hits'] + phase2_stats['import_hits']
-        import_misses = phase1_stats['import_misses'] + phase2_stats['import_misses']
-        local_hits = phase1_stats['local_hits'] + phase2_stats['local_hits']
-        cross_hits = phase1_stats['cross_hits'] + phase2_stats['cross_hits']
-        lcp_lengths = phase1_stats['lcp_lengths'] + phase2_stats['lcp_lengths']
-        avg_lcp = sum(lcp_lengths) / len(lcp_lengths) if lcp_lengths else 0
+            # Combine results
+            latencies = phase1_latencies + phase2_latencies
+            outputs = phase1_outputs + phase2_outputs
+            all_latencies.extend(latencies)
+            all_outputs.extend(outputs)
         
-        # Calculate total_registry_size and total_prefix_index_size for run_stat
-        total_registry_size = max(phase1_stats['registry_size'], phase2_stats['registry_size']) if kv_marketplace else 0
-        total_prefix_index_size = max(phase1_stats['prefix_index_size'], phase2_stats['prefix_index_size']) if kv_marketplace else 0
+            # Calculate run statistics
+            avg_latency = sum(latencies) / len(latencies)
+            total_time = phase1_total_time + phase2_total_time  # Sum of wall-clock times
+            throughput = len(latencies) / total_time if total_time > 0 else 0
+
+            # Combine stats from both phases
+            import_hits = phase1_stats['import_hits'] + phase2_stats['import_hits']
+            import_misses = phase1_stats['import_misses'] + phase2_stats['import_misses']
+            local_hits = phase1_stats['local_hits'] + phase2_stats['local_hits']
+            cross_hits = phase1_stats['cross_hits'] + phase2_stats['cross_hits']
+            lcp_lengths = phase1_stats['lcp_lengths'] + phase2_stats['lcp_lengths']
+            avg_lcp = sum(lcp_lengths) / len(lcp_lengths) if lcp_lengths else 0
         
-        # Calculate Phase 1 metrics
-        phase1_avg_latency = sum(phase1_latencies) / len(phase1_latencies) if phase1_latencies else 0
-        phase1_throughput = len(phase1_latencies) / phase1_total_time if phase1_total_time > 0 else 0
+            # Calculate total_registry_size and total_prefix_index_size for run_stat
+            total_registry_size = max(phase1_stats['registry_size'], phase2_stats['registry_size']) if kv_marketplace else 0
+            total_prefix_index_size = max(phase1_stats['prefix_index_size'], phase2_stats['prefix_index_size']) if kv_marketplace else 0
         
-        # Calculate Phase 2 metrics
-        phase2_avg_latency = sum(phase2_latencies) / len(phase2_latencies) if phase2_latencies else 0
-        phase2_throughput = len(phase2_latencies) / phase2_total_time if phase2_total_time > 0 else 0
+            # Calculate Phase 1 metrics
+            phase1_avg_latency = sum(phase1_latencies) / len(phase1_latencies) if phase1_latencies else 0
+            phase1_throughput = len(phase1_latencies) / phase1_total_time if phase1_total_time > 0 else 0
         
-        run_stat = {
-            'run': run_idx + 1,
-            'avg_latency': avg_latency,
-            'total_latency': total_time,
-            'throughput': throughput,
-            'registry_size': total_registry_size,
-            'prefix_index_size': total_prefix_index_size,
-            'import_hits': import_hits,
-            'import_misses': import_misses,
-            'local_hits': local_hits,
-            'cross_hits': cross_hits,
-            'import_lcp_lengths': lcp_lengths,
-            # Phase 1 metrics
-            'phase1_avg_latency': phase1_avg_latency,
-            'phase1_total_time': phase1_total_time,
-            'phase1_throughput': phase1_throughput,
-            'phase1_local_hits': phase1_stats.get('local_hits', 0),
-            'phase1_cross_hits': phase1_stats.get('cross_hits', 0),
-            'phase1_import_hits': phase1_stats.get('import_hits', 0),
-            'phase1_import_misses': phase1_stats.get('import_misses', 0),
-            # Phase 2 metrics
-            'phase2_avg_latency': phase2_avg_latency,
-            'phase2_total_time': phase2_total_time,
-            'phase2_throughput': phase2_throughput,
-            'phase2_local_hits': phase2_stats.get('local_hits', 0),
-            'phase2_cross_hits': phase2_stats.get('cross_hits', 0),
-            'phase2_import_hits': phase2_stats.get('import_hits', 0),
-            'phase2_import_misses': phase2_stats.get('import_misses', 0),
-            'num_requests': len(latencies),
-        }
-        run_stats.append(run_stat)
+            # Calculate Phase 2 metrics
+            phase2_avg_latency = sum(phase2_latencies) / len(phase2_latencies) if phase2_latencies else 0
+            phase2_throughput = len(phase2_latencies) / phase2_total_time if phase2_total_time > 0 else 0
         
-        print(f"  Average latency: {avg_latency:.4f}s")
-        print(f"  Total time: {total_time:.4f}s")
-        print(f"  Throughput: {throughput:.2f} req/s")
-        if kv_marketplace:
-            print(f"  Registry size: {total_registry_size}")
-            print(f"  Prefix index size: {total_prefix_index_size}")
-            if avg_lcp > 0:
-                print(f"  Average LCP length: {avg_lcp:.1f} tokens")
-            if cross_hits == 0 and not prefetch_phase2:
-                print(f"  WARNING: No cross-GPU hits! Marketplace benefit requires cross_hits > 0")
+            run_stat = {
+                'run': run_idx + 1,
+                'avg_latency': avg_latency,
+                'total_latency': total_time,
+                'throughput': throughput,
+                'registry_size': total_registry_size,
+                'prefix_index_size': total_prefix_index_size,
+                'import_hits': import_hits,
+                'import_misses': import_misses,
+                'local_hits': local_hits,
+                'cross_hits': cross_hits,
+                'import_lcp_lengths': lcp_lengths,
+                # Phase 1 metrics
+                'phase1_avg_latency': phase1_avg_latency,
+                'phase1_total_time': phase1_total_time,
+                'phase1_throughput': phase1_throughput,
+                'phase1_local_hits': phase1_stats.get('local_hits', 0),
+                'phase1_cross_hits': phase1_stats.get('cross_hits', 0),
+                'phase1_import_hits': phase1_stats.get('import_hits', 0),
+                'phase1_import_misses': phase1_stats.get('import_misses', 0),
+                # Phase 2 metrics
+                'phase2_avg_latency': phase2_avg_latency,
+                'phase2_total_time': phase2_total_time,
+                'phase2_throughput': phase2_throughput,
+                'phase2_local_hits': phase2_stats.get('local_hits', 0),
+                'phase2_cross_hits': phase2_stats.get('cross_hits', 0),
+                'phase2_import_hits': phase2_stats.get('import_hits', 0),
+                'phase2_import_misses': phase2_stats.get('import_misses', 0),
+                'num_requests': len(latencies),
+            }
+            run_stats.append(run_stat)
+        
+            print(f"  Average latency: {avg_latency:.4f}s")
+            print(f"  Total time: {total_time:.4f}s")
+            print(f"  Throughput: {throughput:.2f} req/s")
+            if kv_marketplace:
+                print(f"  Registry size: {total_registry_size}")
+                print(f"  Prefix index size: {total_prefix_index_size}")
+                if avg_lcp > 0:
+                    print(f"  Average LCP length: {avg_lcp:.1f} tokens")
+                if cross_hits == 0 and not prefetch_phase2:
+                    print(f"  WARNING: No cross-GPU hits! Marketplace benefit requires cross_hits > 0")
+        finally:
+            cleanup_phase1()
     
     # Calculate overall statistics
     # For batched runs, we need to sum the wall-clock times from each run, not individual latencies
@@ -1196,6 +1254,8 @@ Examples:
                        help='Print all generated outputs for each run (default: hidden)')
     parser.add_argument('--disable-speculative', action='store_true',
                        help='Disable speculative decoding when constructing the LLM (default: enabled)')
+    parser.add_argument('--dump-kv-dir', type=str, default=None,
+                       help='Directory to dump exported KV caches for offline comparison (default: disabled)')
     
     args = parser.parse_args()
 
@@ -1254,6 +1314,7 @@ Examples:
                 prefetch_phase2=prefetch_phase2,
                 print_outputs=args.print_outputs,
                 enable_speculative=not args.disable_speculative,
+                dump_kv_dir=args.dump_kv_dir,
             )
         else:
             results_without = None
@@ -1275,6 +1336,7 @@ Examples:
             prefetch_phase2=prefetch_phase2,
             print_outputs=args.print_outputs,
             enable_speculative=not args.disable_speculative,
+            dump_kv_dir=args.dump_kv_dir,
         )
         
         # Create comparison chart (only if both results exist)
@@ -1316,6 +1378,7 @@ Examples:
             prefetch_phase2=prefetch_phase2,
             print_outputs=args.print_outputs,
             enable_speculative=not args.disable_speculative,
+            dump_kv_dir=args.dump_kv_dir,
         )
         
         if results:
