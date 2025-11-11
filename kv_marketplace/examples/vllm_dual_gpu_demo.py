@@ -244,10 +244,7 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
     # Also silence Ray/uvloop noise
     os.environ.setdefault("RAY_USAGE_STATS_ENABLED", "0")
     os.environ.setdefault("RAY_DISABLE_IMPORT_WARNING", "1")
-    if capture_logits:
-        logging.disable(logging.NOTSET)
-    else:
-        logging.disable(logging.CRITICAL)
+    logging.disable(logging.CRITICAL)
     
     if dump_kv_dir:
         dump_target_dir = os.path.abspath(os.path.expanduser(dump_kv_dir))
@@ -268,8 +265,6 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
         os.environ['KV_MARKETPLACE_DISABLE_IMPORT'] = '1'
     else:
         os.environ.pop('KV_MARKETPLACE_DISABLE_IMPORT', None)
-    if capture_logits or os.environ.get('KV_MARKETPLACE_EXPORT_DEBUG') == '1':
-        os.environ.setdefault('KV_MARKETPLACE_EXPORT_DEBUG', '1')
     
     # Check if kv-marketplace is enabled
     kvm_enabled = bool(shared_kwargs.get("kv_marketplace", False))
@@ -288,7 +283,6 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
     
     llm = None
     get_stats = None
-    adapter_get_registry_keys = None
     
     try:
         # Import vllm - this will use the editable install from vllm/ folder (which is correct)
@@ -324,7 +318,6 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
             # Only import kv_marketplace adapter if it's enabled
             from kv_marketplace.adapter.vllm import (
                 get_stats,
-                get_registry_keys as adapter_get_registry_keys,
                 reset_stats as adapter_reset_stats,
                 set_min_prefix_length,
             )
@@ -337,7 +330,6 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
         else:
             # Skip adapter import entirely if kv-marketplace is disabled
             get_stats = None
-            adapter_get_registry_keys = None
         
         # Local version of measure_latency_concurrent for child process.
         # Uses batched generation to avoid thread-safety issues.
@@ -463,12 +455,6 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
                 })
             except Exception:
                 pass  # keep zeros
-        registry_keys = None
-        if kvm_enabled and adapter_get_registry_keys is not None:
-            try:
-                registry_keys = adapter_get_registry_keys()
-            except Exception:
-                registry_keys = None
         
         # Put results in queue
         result = {
@@ -477,7 +463,6 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
             "wall": wall,
             "stats": stats,
             "prefetch_only": prefetch_only,
-            "registry_keys": registry_keys,
         }
         captured_logits_payload = None
         if capture_logits and raw_outputs:
@@ -1249,9 +1234,6 @@ def run_logits_divergence_check(
             f"prefix_index_size={stats_snapshot['prefix_index_size']}, "
             f"import_hits={stats_snapshot['import_hits']}, cross_hits={stats_snapshot['cross_hits']}"
         )
-        child_registry_keys = results[cfg['key']].get('registry_keys')
-        if child_registry_keys is not None:
-            print(f"  Child saw {len(child_registry_keys)} registry keys")
 
     def _tensor_from_result(key: str) -> Tuple[torch.Tensor, torch.Tensor]:
         payload = results[key].get('captured_logits')
@@ -1642,7 +1624,6 @@ Examples:
         print("WARNING: PyTorch not available, cannot check GPU count")
 
     if args.logits_divergence_check:
-        os.environ['KV_MARKETPLACE_EXPORT_DEBUG'] = '1'
         run_logits_divergence_check(
             model=args.model,
             system_prompt=args.system_prompt,
