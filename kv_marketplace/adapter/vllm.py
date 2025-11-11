@@ -112,6 +112,13 @@ if _REHOME_AFTER_IMPORT:
 
 _DUMP_MAX_TOKENS = _env_int('KV_MARKETPLACE_DUMP_MAX_TOKENS', 0)
 
+
+def _is_import_disabled() -> bool:
+    val = os.environ.get('KV_MARKETPLACE_DISABLE_IMPORT')
+    if val is None:
+        return False
+    return val.lower() in ('1', 'true', 'yes', 'on')
+
 # File-based stats sharing for multiprocessing
 _stats_file = None
 _stats_lock_file = None
@@ -812,6 +819,9 @@ def before_prefill(ctx: VLLMImportCtx) -> Optional[Tuple[int, AllocatedKV]]:
     total_start = time.perf_counter()
     
     try:
+        if _is_import_disabled():
+            logger.info("kv-marketplace: import disabled via KV_MARKETPLACE_DISABLE_IMPORT")
+            return None
         # Get compatibility from context
         compat = ctx['compat']
         tokens = ctx['tokens']
