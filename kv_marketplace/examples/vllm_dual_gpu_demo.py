@@ -1259,6 +1259,14 @@ Examples:
     
     args = parser.parse_args()
 
+    if args.compare and args.no_kv_marketplace:
+        print("ERROR: --compare always runs both baseline and kv-marketplace passes. "
+              "Remove --no-kv-marketplace or drop --compare.")
+        sys.exit(2)
+    if not args.compare and args.kv_marketplace_only:
+        print("ERROR: --kv-marketplace-only only applies when --compare is set.")
+        sys.exit(2)
+
     if args.enable_logging:
         logging.getLogger("kv_marketplace").setLevel(logging.INFO)
     
