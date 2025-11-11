@@ -209,7 +209,8 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
               dump_kv_label: Optional[str] = None,
               capture_logits: bool = False,
               capture_label: Optional[str] = None,
-              disable_import: bool = False):
+              disable_import: bool = False,
+              export_debug: bool = False):
     """Child process function that runs one phase of the benchmark.
     
     Sets CUDA_VISIBLE_DEVICES, initializes LLM, runs batched generation,
@@ -244,7 +245,7 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
     # Also silence Ray/uvloop noise
     os.environ.setdefault("RAY_USAGE_STATS_ENABLED", "0")
     os.environ.setdefault("RAY_DISABLE_IMPORT_WARNING", "1")
-    logging.disable(logging.CRITICAL)
+    # logging.disable(logging.CRITICAL)
     
     if dump_kv_dir:
         dump_target_dir = os.path.abspath(os.path.expanduser(dump_kv_dir))
@@ -265,6 +266,8 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
         os.environ['KV_MARKETPLACE_DISABLE_IMPORT'] = '1'
     else:
         os.environ.pop('KV_MARKETPLACE_DISABLE_IMPORT', None)
+    if export_debug:
+        os.environ['KV_MARKETPLACE_EXPORT_DEBUG'] = '1'
     
     # Check if kv-marketplace is enabled
     kvm_enabled = bool(shared_kwargs.get("kv_marketplace", False))
@@ -1065,6 +1068,7 @@ def run_logits_divergence_check(
     dtype: str = "float16",
     tokenizer_mode: str = "mistral",
     llm_kwargs: Optional[Dict] = None,
+    only_phase: Optional[str] = None,
 ):
     """Run four deterministic passes and compare logits across phases."""
     import torch
@@ -1195,6 +1199,7 @@ def run_logits_divergence_check(
                 'capture_logits': True,
                 'capture_label': run_cfg['key'],
                 'disable_import': run_cfg['disable_import'],
+                'export_debug': True,
             },
         )
         process.start()
@@ -1212,7 +1217,12 @@ def run_logits_divergence_check(
         return result
 
     results: Dict[str, Dict] = {}
+    if only_phase:
+        print(f"\nRunning only phase {only_phase} (per --logits-only-phase)")
+
     for cfg in run_plan:
+        if only_phase and cfg['key'] != only_phase:
+            continue
         print(f"\n--- {cfg['key']}: {cfg['desc']} ---")
         if cfg['key'] == 'B' and clear_registry_fn:
             try:
@@ -1234,6 +1244,13 @@ def run_logits_divergence_check(
             f"prefix_index_size={stats_snapshot['prefix_index_size']}, "
             f"import_hits={stats_snapshot['import_hits']}, cross_hits={stats_snapshot['cross_hits']}"
         )
+
+    if not results:
+        raise RuntimeError("No phases were executed; check --logits-only-phase value.")
+
+    if only_phase:
+        print(f"\n✓ Completed phase {only_phase} (logits-only-phase). Skipping comparisons.")
+        return {'results': results}
 
     def _tensor_from_result(key: str) -> Tuple[torch.Tensor, torch.Tensor]:
         payload = results[key].get('captured_logits')
@@ -1579,6 +1596,12 @@ Examples:
                        help='Run deterministic Phase1/Phase2 logits comparison and exit')
     parser.add_argument('--logits-check-seed', type=int, default=1234,
                        help='Seed to use when running --logits-divergence-check (default: 1234)')
+    parser.add_argument(
+        '--logits-only-phase',
+        choices=['A', 'B', 'C', 'D'],
+        default=None,
+        help='When used with --logits-divergence-check, only run the specified phase (A/B/C/D)',
+    )
     
     args = parser.parse_args()
 
@@ -1633,6 +1656,7 @@ Examples:
             tensor_parallel_size=args.tensor_parallel_size,
             max_model_len=args.max_model_len,
             seed=args.logits_check_seed,
+            only_phase=args.logits_only_phase,
         )
         return
 
