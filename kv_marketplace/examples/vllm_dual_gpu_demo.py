@@ -93,6 +93,51 @@ def create_shared_prefix_prompts(system_prompt: str, user_prompts: List[str]) ->
     return [f"{system_prompt}\n\nUser: {prompt}\n\nAssistant:" for prompt in user_prompts]
 
 
+def build_shared_kwargs(
+    kv_marketplace: bool,
+    kv_min_prefix: int,
+    gpu_memory_utilization: float,
+    tensor_parallel_size: int,
+    max_model_len: int,
+    dtype: str,
+    tokenizer_mode: str,
+    enable_speculative: bool,
+    speculative_config: Optional[Dict],
+    llm_kwargs: Optional[Dict] = None,
+) -> Dict:
+    """Construct shared LLM kwargs used by child processes."""
+    llm_kwargs = dict(llm_kwargs or {})
+    resolved_spec_config = None
+    if enable_speculative:
+        resolved_spec_config = speculative_config or {
+            "method": "ngram",
+            "num_speculative_tokens": 6,
+            "prompt_lookup_min": 3,
+            "prompt_lookup_max": 8,
+        }
+
+    shared_kwargs = {
+        'kv_marketplace': kv_marketplace,
+        'kv_min_prefix': kv_min_prefix,
+        'gpu_memory_utilization': gpu_memory_utilization,
+        'tensor_parallel_size': 1,  # Force TP=1 for data parallelism between processes
+        'max_model_len': max_model_len,
+        'enable_prefix_caching': True,
+        'distributed_executor_backend': 'mp',
+        **llm_kwargs,
+    }
+    shared_kwargs.setdefault('dtype', dtype)
+    shared_kwargs.setdefault('tokenizer_mode', tokenizer_mode)
+    shared_kwargs.pop('device', None)
+
+    if enable_speculative and resolved_spec_config:
+        shared_kwargs.setdefault('speculative_config', resolved_spec_config)
+    else:
+        shared_kwargs.pop('speculative_config', None)
+
+    return shared_kwargs
+
+
 def measure_latency_concurrent(llm, prompts: List[str], sampling_params: Any, 
                                batch_name: str = "batch") -> Tuple[List[float], List[str], List[int], float]:
     """Measure generation latency for prompts using batched generation.
@@ -161,7 +206,10 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
               prefetch_sampling_params_dict: Optional[Dict] = None,
               hold_gpu_event: Optional[Event] = None,
               dump_kv_dir: Optional[str] = None,
-              dump_kv_label: Optional[str] = None):
+              dump_kv_label: Optional[str] = None,
+              capture_logits: bool = False,
+              capture_label: Optional[str] = None,
+              disable_import: bool = False):
     """Child process function that runs one phase of the benchmark.
     
     Sets CUDA_VISIBLE_DEVICES, initializes LLM, runs batched generation,
@@ -212,6 +260,11 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
     else:
         os.environ.pop('KV_MARKETPLACE_DUMP_DIR', None)
         os.environ.pop('KV_MARKETPLACE_DUMP_LABEL', None)
+
+    if disable_import:
+        os.environ['KV_MARKETPLACE_DISABLE_IMPORT'] = '1'
+    else:
+        os.environ.pop('KV_MARKETPLACE_DISABLE_IMPORT', None)
     
     # Check if kv-marketplace is enabled
     kvm_enabled = bool(shared_kwargs.get("kv_marketplace", False))
@@ -255,20 +308,32 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
         
         # Recreate SamplingParams in child process to avoid multiprocessing serialization issues
         # This ensures the object is created fresh in this process context
-        sampling_params = SamplingParams(**sampling_params_dict)
+        sampling_params_kwargs = dict(sampling_params_dict)
+        if capture_logits:
+            sampling_params_kwargs['logprobs'] = -1
+        sampling_params = SamplingParams(**sampling_params_kwargs)
 
         reset_stats_fn = None
         if kvm_enabled:
             # Only import kv_marketplace adapter if it's enabled
-            from kv_marketplace.adapter.vllm import get_stats, reset_stats as adapter_reset_stats
+            from kv_marketplace.adapter.vllm import (
+                get_stats,
+                reset_stats as adapter_reset_stats,
+                set_min_prefix_length,
+            )
             reset_stats_fn = adapter_reset_stats
+            kv_prefix_len = int(shared_kwargs.get('kv_min_prefix', 64))
+            try:
+                set_min_prefix_length(kv_prefix_len)
+            except Exception as exc:
+                print(f"Warning: failed to set kv_min_prefix to {kv_prefix_len}: {exc}")
         else:
             # Skip adapter import entirely if kv-marketplace is disabled
             get_stats = None
         
         # Local version of measure_latency_concurrent for child process.
         # Uses batched generation to avoid thread-safety issues.
-        def measure_latency_concurrent_local(llm, prompts, sampling_params, batch_name):
+        def measure_latency_concurrent_local(llm, prompts, sampling_params, batch_name, capture_raw=False):
             """Local version of measure_latency_concurrent for child process.
             
             Uses a single batched call to avoid socket protocol corruption from
@@ -285,7 +350,7 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
             except Exception as e:
                 print(f"  Error in batched generation: {e}")
                 # Return empty results on error
-                return ([0.0] * len(prompts), [""] * len(prompts), [], 0.0)
+                return ([0.0] * len(prompts), [""] * len(prompts), [], 0.0, None)
             
             batch_end = time.time()
             total_wall_time = batch_end - batch_start
@@ -304,8 +369,9 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
                 
                 outputs.append(output)
                 latencies.append(latency)
+            raw_payload = results if capture_raw else None
             
-            return latencies, outputs, [], total_wall_time
+            return latencies, outputs, [], total_wall_time, raw_payload
         
         # NOTE: Do NOT reset_stats() here - it's already called in parent before spawning.
         # Resetting here could accidentally wipe Phase-1 exports before Phase-2 reads them.
@@ -335,7 +401,7 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
         prefetch_info = None
         if prefetch_prompts and prefetch_sampling_params_dict:
             pref_sampling_params = SamplingParams(**prefetch_sampling_params_dict)
-            pref_lats, pref_outs, _, pref_wall = measure_latency_concurrent_local(
+            pref_lats, pref_outs, _, pref_wall, _ = measure_latency_concurrent_local(
                 llm, prefetch_prompts, pref_sampling_params, f"{phase_name}-prefetch"
             )
             pref_stats = zero_stats()
@@ -369,7 +435,9 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
                     pass
 
         # Run batched generation for measured prompts
-        lats, outs, _, wall = measure_latency_concurrent_local(llm, prompts, sampling_params, phase_name)
+        lats, outs, _, wall, raw_outputs = measure_latency_concurrent_local(
+            llm, prompts, sampling_params, phase_name, capture_raw=capture_logits
+        )
         
         # Get adapter stats - default to zeros, overwrite only if enabled and callable succeeds
         stats = zero_stats()
@@ -396,8 +464,30 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
             "stats": stats,
             "prefetch_only": prefetch_only,
         }
+        captured_logits_payload = None
+        if capture_logits and raw_outputs:
+            captured_logits_payload = []
+            for req in raw_outputs:
+                if not req or not getattr(req, 'outputs', None):
+                    continue
+                completion = req.outputs[0]
+                sample_logprobs = completion.logprobs or []
+                if not sample_logprobs:
+                    continue
+                position_logprobs = sample_logprobs[0]
+                if not position_logprobs:
+                    continue
+                token_ids = sorted(position_logprobs.keys())
+                logprob_values = [position_logprobs[token_id].logprob for token_id in token_ids]
+                captured_logits_payload.append({
+                    'token_ids': token_ids,
+                    'logprobs': logprob_values,
+                })
+
         if prefetch_info is not None:
             result["prefetch"] = prefetch_info
+        if captured_logits_payload is not None:
+            result["captured_logits"] = captured_logits_payload
         result_queue.put(result)
         if hold_gpu_event is not None:
             try:
@@ -413,7 +503,8 @@ def child_run(device_mask: str, model: str, shared_kwargs: Dict, prompts: List[s
             "latencies": [],
             "outputs": [],
             "wall": 0.0,
-            "stats": zero_stats()
+            "stats": zero_stats(),
+            "captured_logits": None,
         })
     finally:
         # CRITICAL: Always shut down the LLM engine to prevent hanging
@@ -641,36 +732,18 @@ def run_benchmark(
         os.environ.setdefault('KV_MARKETPLACE_HANDLE_CACHE_SIZE', 'inf')
     
     # Shared kwargs for both child processes
-    if speculative_config is None and enable_speculative:
-        speculative_config = {
-            "method": "ngram",
-            "num_speculative_tokens": 6,
-            "prompt_lookup_min": 3,
-            "prompt_lookup_max": 8,
-        }
-    elif not enable_speculative:
-        speculative_config = None
-
-    shared_kwargs = {
-        'kv_marketplace': kv_marketplace,
-        'kv_min_prefix': kv_min_prefix,
-        'gpu_memory_utilization': gpu_memory_utilization,
-        'tensor_parallel_size': 1,  # Force TP=1 for data parallelism
-        'max_model_len': max_model_len,
-        'enable_prefix_caching': True,  # Always enable prefix caching
-        'distributed_executor_backend': 'mp',  # Use multiprocessing instead of Ray
-        # Note: worker_multiprocess_method is controlled via VLLM_WORKER_MULTIPROC_METHOD env var
-        # (set in child_run before any torch/vllm imports)
-        **llm_kwargs
-    }
-    shared_kwargs.setdefault('dtype', dtype)
-    shared_kwargs.setdefault('tokenizer_mode', tokenizer_mode)
-    # Guard against accidental 'device' kwargs sneaking in through llm_kwargs/etc.
-    shared_kwargs.pop('device', None)
-    if enable_speculative and speculative_config:
-        shared_kwargs.setdefault('speculative_config', speculative_config)
-    else:
-        shared_kwargs.pop('speculative_config', None)
+    shared_kwargs = build_shared_kwargs(
+        kv_marketplace=kv_marketplace,
+        kv_min_prefix=kv_min_prefix,
+        gpu_memory_utilization=gpu_memory_utilization,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        dtype=dtype,
+        tokenizer_mode=tokenizer_mode,
+        enable_speculative=enable_speculative,
+        speculative_config=speculative_config,
+        llm_kwargs=llm_kwargs,
+    )
     
     # Convert SamplingParams to dict for multiprocessing (avoids serialization issues with vLLM)
     # This prevents msgspec validation errors when the object is pickled/unpickled across processes
@@ -980,6 +1053,252 @@ def run_benchmark(
     return result
 
 
+def run_logits_divergence_check(
+    model: str,
+    system_prompt: str,
+    user_prompts: List[str],
+    kv_min_prefix: int,
+    gpu_memory_utilization: float,
+    tensor_parallel_size: int,
+    max_model_len: int,
+    seed: int,
+    dtype: str = "float16",
+    tokenizer_mode: str = "mistral",
+    llm_kwargs: Optional[Dict] = None,
+):
+    """Run four deterministic passes and compare logits across phases."""
+    import torch
+
+    if not user_prompts:
+        raise ValueError("Need at least one user prompt for logits divergence check")
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        raise RuntimeError("Logits divergence check requires at least 2 CUDA devices")
+
+    prompt = create_shared_prefix_prompts(system_prompt, [user_prompts[0]])[0]
+    prompts = [prompt]
+    sampling_params_dict = {
+        'temperature': 0.0,
+        'top_p': 1.0,
+        'top_k': 1,
+        'max_tokens': 1,
+        'min_tokens': 1,
+        'seed': seed,
+    }
+
+    print("\n" + "=" * 80)
+    print("  LOGITS DIVERGENCE CHECK")
+    print("=" * 80)
+    print(f"Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+    print(f"Seed: {seed}")
+    print("Decoding params: temperature=0.0, top_k=1, top_p=1.0, max_tokens=1")
+
+    os.environ.pop('KV_MARKETPLACE_FILE_BACKEND', None)
+    os.environ.setdefault('KV_MARKETPLACE_SHM_BACKEND', '1')
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "1")
+    os.environ.setdefault("VLLM_USE_FLASHINFER", "1")
+
+    diag_kv_min_prefix = kv_min_prefix if kv_min_prefix <= 1 else 1
+    if diag_kv_min_prefix != kv_min_prefix:
+        print(f"Forcing kv_min_prefix={diag_kv_min_prefix} for logits divergence check (was {kv_min_prefix})")
+
+    diagnostic_llm_kwargs = dict(llm_kwargs or {})
+    diagnostic_llm_kwargs['max_logprobs'] = -1
+
+    shared_kwargs_no_kv = build_shared_kwargs(
+        kv_marketplace=False,
+        kv_min_prefix=diag_kv_min_prefix,
+        gpu_memory_utilization=gpu_memory_utilization,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        dtype=dtype,
+        tokenizer_mode=tokenizer_mode,
+        enable_speculative=False,
+        speculative_config=None,
+        llm_kwargs=diagnostic_llm_kwargs,
+    )
+    shared_kwargs_kv = build_shared_kwargs(
+        kv_marketplace=True,
+        kv_min_prefix=diag_kv_min_prefix,
+        gpu_memory_utilization=gpu_memory_utilization,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        dtype=dtype,
+        tokenizer_mode=tokenizer_mode,
+        enable_speculative=False,
+        speculative_config=None,
+        llm_kwargs=diagnostic_llm_kwargs,
+    )
+
+    get_stats_fn, reset_stats_fn, clear_registry_fn, _ = maybe_get_adapter_funcs()
+    if clear_registry_fn:
+        try:
+            clear_registry_fn()
+            print("Cleared registry and prefix index before logits check")
+        except Exception as exc:
+            print(f"Warning: Failed to clear registry before logits check: {exc}")
+    if reset_stats_fn:
+        try:
+            reset_stats_fn()
+        except Exception:
+            pass
+
+    run_plan = [
+        {
+            'key': 'A',
+            'desc': 'Phase1 baseline (kv disabled)',
+            'device_mask': '0',
+            'shared_kwargs': shared_kwargs_no_kv,
+            'disable_import': False,
+            'phase': 'Phase1',
+        },
+        {
+            'key': 'B',
+            'desc': 'Phase1 control (kv enabled, import disabled)',
+            'device_mask': '0',
+            'shared_kwargs': shared_kwargs_kv,
+            'disable_import': True,
+            'phase': 'Phase1',
+        },
+        {
+            'key': 'C',
+            'desc': 'Phase2 baseline (import disabled)',
+            'device_mask': '1,0',
+            'shared_kwargs': shared_kwargs_kv,
+            'disable_import': True,
+            'phase': 'Phase2',
+        },
+        {
+            'key': 'D',
+            'desc': 'Phase2 reuse enabled',
+            'device_mask': '1,0',
+            'shared_kwargs': shared_kwargs_kv,
+            'disable_import': False,
+            'phase': 'Phase2',
+        },
+    ]
+
+    def _execute(run_cfg: Dict) -> Dict:
+        q = Queue()
+        process = Process(
+            target=child_run,
+            args=(
+                run_cfg['device_mask'],
+                model,
+                dict(run_cfg['shared_kwargs']),
+                prompts,
+                sampling_params_dict,
+                q,
+                run_cfg['phase'],
+            ),
+            kwargs={
+                'capture_logits': True,
+                'capture_label': run_cfg['key'],
+                'disable_import': run_cfg['disable_import'],
+            },
+        )
+        process.start()
+        try:
+            result = q.get(timeout=180)
+        finally:
+            q.close()
+            q.join_thread()
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        if 'error' in result:
+            raise RuntimeError(f"Run {run_cfg['key']} failed: {result['error']}\n{result.get('traceback', '')}")
+        return result
+
+    results: Dict[str, Dict] = {}
+    for cfg in run_plan:
+        print(f"\n--- {cfg['key']}: {cfg['desc']} ---")
+        if cfg['key'] == 'B' and clear_registry_fn:
+            try:
+                clear_registry_fn()
+                if reset_stats_fn:
+                    reset_stats_fn()
+                print("Reset registry before control export run (B)")
+            except Exception as exc:
+                print(f"Warning: Failed to reset registry before run B: {exc}")
+        elif cfg['key'] in ('C', 'D') and reset_stats_fn:
+            try:
+                reset_stats_fn()
+            except Exception:
+                pass
+        results[cfg['key']] = _execute(cfg)
+        stats_snapshot = norm_stats(results[cfg['key']].get('stats', {}))
+        print(
+            f"Run {cfg['key']} stats: registry_size={stats_snapshot['registry_size']}, "
+            f"prefix_index_size={stats_snapshot['prefix_index_size']}, "
+            f"import_hits={stats_snapshot['import_hits']}, cross_hits={stats_snapshot['cross_hits']}"
+        )
+
+    def _tensor_from_result(key: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        payload = results[key].get('captured_logits')
+        if not payload:
+            raise RuntimeError(f"Run {key} did not return logits payload")
+        record = payload[-1]
+        token_ids = record.get('token_ids')
+        logprob_values = record.get('logprobs')
+        if token_ids is None or logprob_values is None:
+            raise RuntimeError(f"Run {key} returned malformed logits payload")
+        token_tensor = torch.tensor(token_ids, dtype=torch.int64)
+        logprob_tensor = torch.tensor(logprob_values, dtype=torch.float32)
+        return token_tensor, logprob_tensor
+
+    logits = {key: _tensor_from_result(key) for key in results}
+
+    def _compare(lhs_key: str, rhs_key: str) -> Tuple[bool, float]:
+        lhs_tokens, lhs_vals = logits[lhs_key]
+        rhs_tokens, rhs_vals = logits[rhs_key]
+        if lhs_tokens.shape != rhs_tokens.shape or not torch.equal(lhs_tokens, rhs_tokens):
+            raise AssertionError(
+                f"Token ID mismatch between runs {lhs_key} and {rhs_key}; cannot compare logits"
+            )
+        diff = (lhs_vals - rhs_vals).abs().max().item()
+        atol = 1e-6
+        return bool(torch.allclose(lhs_vals, rhs_vals, atol=atol, rtol=atol)), diff
+
+    eq_ab, diff_ab = _compare('A', 'B')
+    eq_ac, diff_ac = _compare('A', 'C')
+    eq_ad, diff_ad = _compare('A', 'D')
+
+    print("\nComparison (max |Δ|):")
+    print(f"  A vs B: {diff_ab:.3e} {'OK' if eq_ab else 'MISMATCH'}")
+    print(f"  A vs C: {diff_ac:.3e} {'OK' if eq_ac else 'MISMATCH'}")
+    print(f"  A vs D: {diff_ad:.3e} {'OK' if eq_ad else 'MISMATCH'}")
+
+    if not eq_ab:
+        raise AssertionError(
+            f"Control mismatch: Phase1 baseline (A) != Phase1 control (B). max |Δ|={diff_ab:.3e}"
+        )
+
+    if eq_ac and not eq_ad:
+        raise AssertionError(
+            "Import path divergence detected: Phase2 without reuse matches baseline, "
+            f"but enabling reuse changes logits (max |Δ|={diff_ad:.3e})."
+        )
+
+    if not eq_ac:
+        raise AssertionError(
+            "Phase2 baseline diverges before reuse: C != A. "
+            f"Investigate Phase2 setup (max |Δ|={diff_ac:.3e})."
+        )
+
+    if not eq_ad:
+        raise AssertionError(
+            "Unexpected mismatch after reuse: Phase2 import did not match baseline."
+        )
+
+    print("\n✓ Logits are identical across all four runs (no divergence detected)")
+    return {
+        'results': results,
+        'logits': logits,
+    }
+
+
 def save_results_to_file(results: Dict, output_file: str):
     """Save benchmark results to a JSON file."""
     import json
@@ -1256,6 +1575,10 @@ Examples:
                        help='Disable speculative decoding when constructing the LLM (default: enabled)')
     parser.add_argument('--dump-kv-dir', type=str, default=None,
                        help='Directory to dump exported KV caches for offline comparison (default: disabled)')
+    parser.add_argument('--logits-divergence-check', action='store_true',
+                       help='Run deterministic Phase1/Phase2 logits comparison and exit')
+    parser.add_argument('--logits-check-seed', type=int, default=1234,
+                       help='Seed to use when running --logits-divergence-check (default: 1234)')
     
     args = parser.parse_args()
 
@@ -1265,6 +1588,9 @@ Examples:
         sys.exit(2)
     if not args.compare and args.kv_marketplace_only:
         print("ERROR: --kv-marketplace-only only applies when --compare is set.")
+        sys.exit(2)
+    if args.logits_divergence_check and args.compare:
+        print("ERROR: --logits-divergence-check cannot be combined with --compare")
         sys.exit(2)
 
     if args.enable_logging:
@@ -1296,7 +1622,20 @@ Examples:
     
     except ImportError:
         print("WARNING: PyTorch not available, cannot check GPU count")
-    
+
+    if args.logits_divergence_check:
+        run_logits_divergence_check(
+            model=args.model,
+            system_prompt=args.system_prompt,
+            user_prompts=args.user_prompts,
+            kv_min_prefix=args.kv_min_prefix,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            tensor_parallel_size=args.tensor_parallel_size,
+            max_model_len=args.max_model_len,
+            seed=args.logits_check_seed,
+        )
+        return
+
     # Run benchmarks
     results_with = None
     results_without = None
