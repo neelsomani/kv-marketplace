@@ -1,7 +1,5 @@
 """vLLM adapter implementing the callback contract."""
 
-print(f"kv-marketplace adapter.vllm module path: {__file__}", flush=True)
-
 import logging
 import json
 import os
@@ -189,9 +187,10 @@ def _register_handle_for_device(
         _registry.register(compat, prefix_hash, handle)
         _cache_handle(cache_key, handle)
         _write_stats_to_file()
-        print(
-            f"kv-mkt adapter._register_handle_for_device: registered prefix={prefix_hash.hex()[:16]} device={device_id}",
-            flush=True,
+        logger.debug(
+            "kv-marketplace: registered prefix=%s device=%s",
+            prefix_hash.hex()[:16],
+            device_id,
         )
     except Exception as exc:
         logger.warning(
@@ -1261,9 +1260,11 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
         device_id = ctx['device_id']
         kv_pages = ctx['kv_pages']
         layout = ctx['layout']
-        print(
-            f"kv-mkt adapter.after_prefill: enter device={device_id} length={length} tokens={len(tokens)}",
-            flush=True,
+        logger.debug(
+            "kv-marketplace after_prefill: device=%s length=%s tokens=%s",
+            device_id,
+            length,
+            len(tokens),
         )
         
         # Convert compat dict to KVCompat if needed
@@ -1289,10 +1290,6 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
                 f"Returned keys: {list(kv_pages.keys())}, type: {type(kv_pages)}, "
                 f"length={length}, device_id={device_id}"
             )
-            print(
-                f"kv-mkt adapter.after_prefill: kv_pages missing k_ptrs device={device_id} keys={list(kv_pages.keys())}",
-                flush=True,
-            )
             return
         
         if 'v_ptrs' not in kv_pages:
@@ -1300,10 +1297,6 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
                 f"kv-marketplace: kv_pages dict missing 'v_ptrs' key. "
                 f"Returned keys: {list(kv_pages.keys())}, type: {type(kv_pages)}, "
                 f"length={length}, device_id={device_id}"
-            )
-            print(
-                f"kv-mkt adapter.after_prefill: kv_pages missing v_ptrs device={device_id} keys={list(kv_pages.keys())}",
-                flush=True,
             )
             return
         
@@ -1328,23 +1321,15 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
                 f"v_ptrs={v_ptrs[:5] if len(v_ptrs) > 0 else []}. "
                 f"This may indicate get_prefill_pages needs implementation or blocks aren't available yet."
             )
-            print(
-                "kv-mkt adapter.after_prefill: EMPTY PTRS device=%s len=%s k_ptrs=%s v_ptrs=%s"
-                % (
-                    device_id,
-                    length,
-                    k_ptrs[:5] if len(k_ptrs) > 0 else [],
-                    v_ptrs[:5] if len(v_ptrs) > 0 else [],
-                ),
-                flush=True,
-            )
             return
         
         # Compute prefix hash and insert into prefix index
         prefix_hash = _prefix_index.insert(prefix_tokens)
-        print(
-            f"kv-mkt adapter.after_prefill: inserted prefix len={length} hash={prefix_hash.hex()[:16]} device={device_id}",
-            flush=True,
+        logger.debug(
+            "kv-marketplace: inserted prefix len=%s hash=%s device=%s",
+            length,
+            prefix_hash.hex()[:16],
+            device_id,
         )
         
         # Build KVHandle from context
@@ -1384,9 +1369,11 @@ def after_prefill(ctx: VLLMExportCtx) -> None:
             device_id=device_id,
             dump_kind="export",
         )
-        print(
-            f"kv-mkt adapter.after_prefill: registered handle length={length} device={device_id} registry_size={_registry.size()}",
-            flush=True,
+        logger.debug(
+            "kv-marketplace: handle registered length=%s device=%s registry_size=%s",
+            length,
+            device_id,
+            _registry.size(),
         )
         
     except Exception as e:
